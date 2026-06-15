@@ -73,6 +73,7 @@ def run_bot():
     )
 
     while running:
+        cycle_error = False
         cycle_start = time()
         logger.info("=" * 50)
         logger.info(f"Cycle start: {cycle_start}")
@@ -187,14 +188,12 @@ def run_bot():
                     logger.info(f"Created position ID {token_id}")
 
         except Exception as e:
-            err_str = str(e)
-            if "rate limited" in err_str.lower() or "rpc" in err_str.lower():
-                logger.warning(f"RPC error, retrying next cycle: {err_str[:120]}")
-            else:
-                logger.error(f"Cycle error: {err_str[:200]}", exc_info=True)
+            logger.warning(f"Cycle error, retrying in 60s: {e}")
+            cycle_error = True
 
         elapsed = time() - cycle_start
-        remaining = config.SLEEP_INTERVAL - elapsed
+        remaining = 60 if cycle_error else config.SLEEP_INTERVAL - elapsed
+        cycle_error = False
         if remaining > 0 and running:
             logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s... (type 'skip' + Enter to start next cycle now)")
             import sys
