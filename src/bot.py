@@ -1,5 +1,6 @@
 import logging
 import signal
+import sys
 from time import sleep, time
 
 from src.config import config
@@ -166,10 +167,29 @@ def run_bot():
         elapsed = time() - cycle_start
         remaining = config.SLEEP_INTERVAL - elapsed
         if remaining > 0 and running:
-            logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s...")
-            for _ in range(int(remaining)):
-                if not running:
-                    break
-                sleep(1)
+            logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s... (type 'skip' + Enter to start next cycle now)")
+            if sys.platform == "win32":
+                import msvcrt
+                for _ in range(int(remaining)):
+                    if not running:
+                        break
+                    if msvcrt.kbhit():
+                        chars = []
+                        while msvcrt.kbhit():
+                            c = msvcrt.getwche()
+                            if c == '\r':
+                                break
+                            chars.append(c)
+                        cmd = ''.join(chars).strip().lower()
+                        if cmd == "skip":
+                            print()
+                            logger.info("Skip received, starting next cycle...")
+                            break
+                    sleep(1)
+            else:
+                for _ in range(int(remaining)):
+                    if not running:
+                        break
+                    sleep(1)
 
     logger.info("Bot stopped.")
