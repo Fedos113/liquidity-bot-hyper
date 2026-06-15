@@ -141,11 +141,11 @@ def run_bot():
                     else:
                         logger.info("Position in range and active.")
 
-                        if wallet_val > 2.0:
-                            logger.info(f"Wallet ${wallet_val:.2f} > $2, adding funds...")
+                        if wallet_val > 0.2:
+                            logger.info(f"Wallet ${wallet_val:.2f} > $0.2, adding funds...")
                             add_to_position(w3, pm, pool, token_id, current_price, pos, dry_run)
                         else:
-                            logger.info(f"Wallet ${wallet_val:.2f} <= $2, checking fees...")
+                            logger.info(f"Wallet ${wallet_val:.2f} <= $0.2, checking fees...")
 
                         fee_owed_0, fee_owed_1 = get_unclaimed_fees(w3, pool, pos)
                         logger.info(
@@ -187,7 +187,11 @@ def run_bot():
                     logger.info(f"Created position ID {token_id}")
 
         except Exception as e:
-            logger.error(f"Cycle error: {e}", exc_info=True)
+            err_str = str(e)
+            if "rate limited" in err_str.lower() or "rpc" in err_str.lower():
+                logger.warning(f"RPC error, retrying next cycle: {err_str[:120]}")
+            else:
+                logger.error(f"Cycle error: {err_str[:200]}", exc_info=True)
 
         elapsed = time() - cycle_start
         remaining = config.SLEEP_INTERVAL - elapsed

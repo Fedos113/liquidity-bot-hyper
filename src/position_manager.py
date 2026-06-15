@@ -339,8 +339,8 @@ def add_to_position(
 
     hype_bal, usdc_bal = get_token_balances(w3)
     wallet_val = (hype_bal / 10**config.HYPE_DECIMALS) * current_price + (usdc_bal / 10**config.USDC_DECIMALS)
-    if wallet_val < 2.0:
-        logger.info(f"Wallet ${wallet_val:.2f} < $2, skipping add-to-position")
+    if wallet_val < 0.2:
+        logger.info(f"Wallet ${wallet_val:.2f} < $0.2, skipping add-to-position")
         return True
 
     slot0 = pool_contract.functions.slot0().call()
@@ -377,7 +377,7 @@ def add_to_position(
         if excess_usd < 2.0:
             break
 
-        swap_frac = min(0.50, 10.0 / max(excess_usd, 1.0))
+        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
         if current_ratio > target_ratio:
             excess_raw1 = raw1 - int(target_ratio * raw0)
             swap_raw = int(excess_raw1 * swap_frac * 0.95)
@@ -512,7 +512,7 @@ def rebalance(
         if excess_usd < 2.0:
             break
 
-        swap_frac = min(0.50, 10.0 / max(excess_usd, 1.0))
+        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
         if current_ratio > target_ratio:
             excess_raw1 = raw1 - int(target_ratio * raw0)
             swap_raw = int(excess_raw1 * swap_frac * 0.95)
@@ -692,7 +692,7 @@ def create_position(
         if excess_usd < 2.0:
             break
 
-        swap_frac = min(0.50, 10.0 / max(excess_usd, 1.0))
+        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
         if current_ratio > target_ratio:
             excess_raw1 = raw1 - int(target_ratio * raw0)
             swap_raw = int(excess_raw1 * swap_frac * 0.95)
@@ -779,7 +779,8 @@ def swap_exact_input_single(
     account = get_account(w3)
     deadline = build_deadline(w3)
 
-    logger.info(f"Swapping {amount_in / 1e18:.4f} tokenIn for tokenOut via fee={fee}")
+    decimals = 6 if token_in.lower() == config.USDC_ADDRESS.lower() else 18
+    logger.info(f"Swapping {amount_in / 10**decimals:.6f} tokenIn for tokenOut via fee={fee}")
 
     tx = router.functions.exactInputSingle({
         "tokenIn": Web3.to_checksum_address(token_in),
