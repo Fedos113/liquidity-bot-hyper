@@ -126,4 +126,4 @@ tail -f liqbot.log
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is proprietary. See [LICENSE](LICENSE) for details.
