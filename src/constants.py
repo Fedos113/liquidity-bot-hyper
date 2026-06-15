@@ -10,6 +10,36 @@ TICK_SPACINGS = {
 POOL_ABI = [
     {
         "inputs": [],
+        "name": "feeGrowthGlobal0X128",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "feeGrowthGlobal1X128",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "int24", "name": "tick", "type": "int24"}],
+        "name": "ticks",
+        "outputs": [
+            {"internalType": "uint128", "name": "liquidityGross", "type": "uint128"},
+            {"internalType": "int128", "name": "liquidityNet", "type": "int128"},
+            {"internalType": "uint256", "name": "feeGrowthOutside0X128", "type": "uint256"},
+            {"internalType": "uint256", "name": "feeGrowthOutside1X128", "type": "uint256"},
+            {"internalType": "int56", "name": "tickCumulativeOutside", "type": "int56"},
+            {"internalType": "uint160", "name": "secondsPerLiquidityOutsideX128", "type": "uint160"},
+            {"internalType": "uint32", "name": "secondsOutside", "type": "uint32"},
+            {"internalType": "bool", "name": "initialized", "type": "bool"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
         "name": "slot0",
         "outputs": [
             {"internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},

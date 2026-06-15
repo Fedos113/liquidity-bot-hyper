@@ -97,14 +97,65 @@ def get_position_details(w3: Web3, position_manager, token_id: int) -> Optional[
             "tickLower": pos[5],
             "tickUpper": pos[6],
             "liquidity": pos[7],
-            "amount0": pos[8],
-            "amount1": pos[9],
-            "amount0Collect": pos[10],
-            "amount1Collect": pos[11],
+            "feeGrowthInside0LastX128": pos[8],
+            "feeGrowthInside1LastX128": pos[9],
+            "tokensOwed0": pos[10],
+            "tokensOwed1": pos[11],
         }
     except Exception as e:
         logger.warning(f"Could not fetch position {token_id}: {e}")
         return None
+
+
+@with_retry(max_retries=3, base_delay=2)
+def get_unclaimed_fees(w3: Web3, pool, pos: dict) -> tuple:
+    tick_lower = pos["tickLower"]
+    tick_upper = pos["tickUpper"]
+    liquidity = pos["liquidity"]
+    fee_growth_inside_0_last = pos["feeGrowthInside0LastX128"]
+    fee_growth_inside_1_last = pos["feeGrowthInside1LastX128"]
+    tokens_owed_0 = pos["tokensOwed0"]
+    tokens_owed_1 = pos["tokensOwed1"]
+
+    if liquidity == 0:
+        return tokens_owed_0, tokens_owed_1
+
+    fee_growth_global_0 = pool.functions.feeGrowthGlobal0X128().call()
+    fee_growth_global_1 = pool.functions.feeGrowthGlobal1X128().call()
+
+    slot0 = pool.functions.slot0().call()
+    current_tick = slot0[1]
+
+    lower_tick = pool.functions.ticks(tick_lower).call()
+    upper_tick = pool.functions.ticks(tick_upper).call()
+
+    def fee_growth_inside(fee_growth_global, lower_outside, upper_outside, tick_lower, tick_upper, current_tick):
+        if current_tick >= tick_lower:
+            below = lower_outside
+        else:
+            below = fee_growth_global - lower_outside
+
+        if current_tick < tick_upper:
+            above = upper_outside
+        else:
+            above = fee_growth_global - upper_outside
+
+        return fee_growth_global - below - above
+
+    current_inside_0 = fee_growth_inside(
+        fee_growth_global_0, lower_tick[2], upper_tick[2],
+        tick_lower, tick_upper, current_tick,
+    )
+    current_inside_1 = fee_growth_inside(
+        fee_growth_global_1, lower_tick[3], upper_tick[3],
+        tick_lower, tick_upper, current_tick,
+    )
+
+    Q128 = 2 ** 128
+    unclaimed_0 = tokens_owed_0 + (liquidity * (current_inside_0 - fee_growth_inside_0_last)) // Q128
+    unclaimed_1 = tokens_owed_1 + (liquidity * (current_inside_1 - fee_growth_inside_1_last)) // Q128
+
+    return unclaimed_0, unclaimed_1
 
 
 @with_retry(max_retries=3, base_delay=2)
@@ -273,6 +324,100 @@ def increase_liquidity(
 
     receipt = send_transaction(w3, tx, dry_run)
     return receipt is not None and receipt["status"] == 1
+
+
+def add_to_position(
+    w3: Web3,
+    position_manager,
+    pool_contract,
+    token_id: int,
+    current_price: float,
+    pos: dict,
+    dry_run: bool = False,
+) -> bool:
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+
+    hype_bal, usdc_bal = get_token_balances(w3)
+    wallet_val = (hype_bal / 10**config.HYPE_DECIMALS) * current_price + (usdc_bal / 10**config.USDC_DECIMALS)
+    if wallet_val < 2.0:
+        logger.info(f"Wallet ${wallet_val:.2f} < $2, skipping add-to-position")
+        return True
+
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    tick_lower = pos["tickLower"]
+    tick_upper = pos["tickUpper"]
+    pool_fee = pool_contract.functions.fee().call()
+
+    logger.info(f"Adding funds to position {token_id} [{tick_lower}, {tick_upper}]")
+
+    if token0_is_hype:
+        raw0, raw1 = hype_bal, usdc_bal
+    else:
+        raw0, raw1 = usdc_bal, hype_bal
+
+    import math
+    Q96 = 2 ** 96
+    sp = sqrt_price_x96 / Q96
+    spl = math.sqrt(1.0001 ** tick_lower)
+    spu = math.sqrt(1.0001 ** tick_upper)
+    target_ratio = sp * spu * (sp - spl) / (spu - sp)
+
+    for iteration in range(5):
+        current_ratio = raw1 / raw0 if raw0 > 0 else float('inf')
+        deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
+        if deviation < 0.01:
+            break
+
+        if current_ratio > target_ratio:
+            excess_usd = (raw1 - target_ratio * raw0) / 10**config.USDC_DECIMALS if token0_is_hype else (raw1 - target_ratio * raw0) / 10**config.HYPE_DECIMALS * current_price
+        else:
+            excess_usd = (raw0 - raw1 / target_ratio) * current_price / 10**config.HYPE_DECIMALS if token0_is_hype else (raw0 - raw1 / target_ratio) / 10**config.USDC_DECIMALS
+
+        if excess_usd < 2.0:
+            break
+
+        swap_frac = min(0.50, 10.0 / max(excess_usd, 1.0))
+        if current_ratio > target_ratio:
+            excess_raw1 = raw1 - int(target_ratio * raw0)
+            swap_raw = int(excess_raw1 * swap_frac * 0.95)
+            if swap_raw >= 1000:
+                t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+                t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+                logger.info(f"Add-to-position swap iter {iteration}: token1 -> token0")
+                approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
+        else:
+            excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
+            swap_raw = int(excess_raw0 * swap_frac * 0.95)
+            if swap_raw >= 1000:
+                t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+                t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+                logger.info(f"Add-to-position swap iter {iteration}: token0 -> token1")
+                approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
+
+        hype_bal, usdc_bal = get_token_balances(w3)
+        raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    from src.math_utils import calculate_token_amounts
+    add0, add1 = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+    add0 = max(1, add0)
+    add1 = max(1, add1)
+    if add0 == 1 and add1 == 1:
+        logger.info("No meaningful amount to add, skipping")
+        return True
+
+    logger.info(f"Adding liquidity: {add0} t0, {add1} t1")
+    approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                  config.POSITION_MANAGER_ADDRESS, add0, dry_run)
+    approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                  config.POSITION_MANAGER_ADDRESS, add1, dry_run)
+    return increase_liquidity(w3, position_manager, token_id, add0, add1, dry_run)
 
 
 def rebalance(

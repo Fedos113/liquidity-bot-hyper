@@ -110,3 +110,23 @@ def calculate_token_amounts(
 
 def calculate_usdc_value(price: float, usdc_amount: float, hype_amount: float) -> float:
     return usdc_amount + hype_amount * price
+
+
+def position_value_usd(liquidity, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, current_price, dec0, dec1):
+    sp = sqrt_price_x96 / Q96
+    spl = math.sqrt(1.0001 ** tick_lower)
+    spu = math.sqrt(1.0001 ** tick_upper)
+
+    if sp <= spl:
+        am0 = int(liquidity * (spu - spl) / (spl * spu))
+        am1 = 0
+    elif sp >= spu:
+        am0 = 0
+        am1 = int(liquidity * (spu - spl))
+    else:
+        am0 = int(liquidity * (spu - sp) / (sp * spu))
+        am1 = int(liquidity * (sp - spl))
+
+    if token0_is_hype:
+        return am0 * current_price / (10 ** dec0) + am1 / (10 ** dec1)
+    return am0 / (10 ** dec0) + am1 * current_price / (10 ** dec1)
