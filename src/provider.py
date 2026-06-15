@@ -8,7 +8,7 @@ from web3.exceptions import Web3Exception
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from src.config import config
-from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI
+from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI, WHYPE_ABI, SWAP_ROUTER_ABI
 
 logger = logging.getLogger("liqbot")
 
@@ -63,6 +63,14 @@ def get_hype_contract(w3: Web3):
 
 def get_usdc_contract(w3: Web3):
     return get_erc20_contract(w3, config.USDC_ADDRESS)
+
+
+def get_whype_contract(w3: Web3):
+    return w3.eth.contract(address=Web3.to_checksum_address(config.HYPE_ADDRESS), abi=WHYPE_ABI)
+
+
+def get_swap_router_contract(w3: Web3):
+    return w3.eth.contract(address=Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS), abi=SWAP_ROUTER_ABI)
 
 
 def get_account(w3: Web3):
