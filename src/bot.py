@@ -14,11 +14,13 @@ from src.position_manager import (
     get_current_price,
     get_position_details,
     rebalance,
+    create_position,
     collect_fees,
     increase_liquidity,
     get_token_balances,
     approve_token,
     get_hype_or_usdc,
+    wrap_hype,
 )
 
 logger = logging.getLogger("liqbot")
@@ -137,21 +139,26 @@ def run_bot():
                     direction = "below" if current_price < lower_price else "above"
                     logger.warning(f"Status: OUT OF RANGE - Price is {direction}")
                     new_id = rebalance(w3, pm, pool, token_id, current_price, dry_run)
-                    if new_id is not None:
+                    if new_id is not None and new_id != token_id:
                         token_id = new_id
+                        config.TOKEN_ID = new_id
                         logger.info(f"Updated token ID to {token_id}")
             elif token_id > 0 and pos is not None:
                 logger.warning("Position exists but has no liquidity. Rebalancing...")
                 new_id = rebalance(w3, pm, pool, token_id, current_price, dry_run)
-                if new_id is not None:
+                if new_id is not None and new_id != token_id:
                     token_id = new_id
+                    config.TOKEN_ID = new_id
             else:
-                logger.warning("No existing position found. Configure TOKEN_ID in .env")
-                if token_id == 0 and not dry_run:
-                    logger.info(
-                        "Auto-creating position not yet implemented. "
-                        "Set TOKEN_ID after minting manually."
-                    )
+                if token_id == 0:
+                    logger.info("No existing position. Attempting auto-creation...")
+                    new_id = create_position(w3, pm, pool, current_price, dry_run)
+                    if new_id is not None:
+                        token_id = new_id
+                        config.TOKEN_ID = new_id
+                        logger.info(f"Auto-created position with token ID {token_id}")
+                else:
+                    logger.warning(f"Position {token_id} not found on-chain")
 
         except Exception as e:
             logger.error(f"Cycle error: {e}", exc_info=True)

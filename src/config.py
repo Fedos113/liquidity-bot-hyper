@@ -12,6 +12,7 @@ class Config:
     POSITION_MANAGER_ADDRESS: str = os.getenv("POSITION_MANAGER_ADDRESS", "")
     HYPE_ADDRESS: str = os.getenv("HYPE_ADDRESS", "")
     USDC_ADDRESS: str = os.getenv("USDC_ADDRESS", "")
+    SWAP_ROUTER_ADDRESS: str = os.getenv("SWAP_ROUTER_ADDRESS", "0x1EbDFC75FfE3ba3de61E7138a3E8706aC841Af9B")
 
     TOKEN_ID: int = int(os.getenv("TOKEN_ID", "0"))
     DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"

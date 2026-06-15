@@ -178,9 +178,6 @@ def mint_position(
     account = get_account(w3)
     deadline = build_deadline(w3)
 
-    slippage = config.SLIPPAGE_TOLERANCE
-    amount0_min = int(amount0_desired * (1 - slippage))
-    amount1_min = int(amount1_desired * (1 - slippage))
     token0_addr = pool_contract.functions.token0().call()
     token1_addr = pool_contract.functions.token1().call()
 
@@ -189,6 +186,9 @@ def mint_position(
         f"amount0={amount0_desired}, amount1={amount1_desired}"
     )
 
+    mint_slippage = config.SLIPPAGE_TOLERANCE * 10
+    amount0_min = int(amount0_desired * (1 - mint_slippage))
+    amount1_min = int(amount1_desired * (1 - mint_slippage))
     tx = position_manager.functions.mint({
         "token0": token0_addr,
         "token1": token1_addr,
@@ -324,11 +324,12 @@ def rebalance(
         approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
         approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
 
-    logger.info("Step 6: Minting new position...")
+    pool_fee = pool_contract.functions.fee().call()
+    logger.info(f"Step 6: Minting new position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
         w3, position_manager, pool_contract,
         tick_lower, tick_upper, amount0_desired, amount1_desired,
-        config.FEE_TIER, dry_run,
+        pool_fee, dry_run,
     )
 
     if new_token_id is None and not dry_run:
@@ -338,6 +339,203 @@ def rebalance(
     result = new_token_id or token_id
     logger.info(f"=== Rebalance complete. Token ID: {result} ===")
     return result
+
+
+def create_position(
+    w3: Web3,
+    position_manager,
+    pool_contract,
+    current_price: float,
+    dry_run: bool = False,
+) -> Optional[int]:
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    tick_spacing = get_tick_spacing(pool_contract)
+    invert = not token0_is_hype
+
+    logger.info("=== Creating new position ===")
+
+    logger.info("Step 0: Balancing tokens...")
+    balance_tokens(w3, pool_contract, dry_run)
+
+    logger.info("Step 1: Calculating bounds...")
+    tick_lower, tick_upper, actual_lower, actual_upper = calculate_bounds(
+        current_price, config.LOWER_BOUND_PCT, config.UPPER_BOUND_PCT,
+        dec0, dec1, tick_spacing, invert,
+    )
+    logger.info(
+        f"New bounds: lower={actual_lower:.4f} (tick {tick_lower}), "
+        f"upper={actual_upper:.4f} (tick {tick_upper})"
+    )
+
+    hype_bal, usdc_bal = get_token_balances(w3)
+    logger.info(
+        f"Wallet: HYPE={hype_bal / 10**config.HYPE_DECIMALS:.4f}, "
+        f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
+    )
+
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    from src.math_utils import calculate_token_amounts
+
+    if token0_is_hype:
+        raw0, raw1 = hype_bal, usdc_bal
+    else:
+        raw0, raw1 = usdc_bal, hype_bal
+
+    if raw0 == 0 and raw1 == 0:
+        logger.warning("No tokens available to create position")
+        return None
+
+    am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+    amount0_desired = max(am0_opt, 1)
+    amount1_desired = max(am1_opt, 1)
+    logger.info(f"Optimal amounts: {amount0_desired} t0, {amount1_desired} t1")
+
+    logger.info("Step 2: Approving tokens...")
+    hype_con = get_hype_or_usdc(w3, True)
+    usdc_con = get_hype_or_usdc(w3, False)
+    pm_addr = config.POSITION_MANAGER_ADDRESS
+
+    if token0_is_hype:
+        approve_token(w3, hype_con, pm_addr, amount0_desired, dry_run)
+        approve_token(w3, usdc_con, pm_addr, amount1_desired, dry_run)
+    else:
+        approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
+        approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
+
+    pool_fee = pool_contract.functions.fee().call()
+    logger.info(f"Step 3: Minting position (fee tier: {pool_fee})...")
+    new_token_id = mint_position(
+        w3, position_manager, pool_contract,
+        tick_lower, tick_upper, amount0_desired, amount1_desired,
+        pool_fee, dry_run,
+    )
+
+    if new_token_id:
+        logger.info(f"=== Position created. Token ID: {new_token_id} ===")
+    else:
+        logger.warning("Position creation failed or could not determine tokenId")
+
+    return new_token_id
+
+
+def wrap_hype(w3: Web3, amount: int, dry_run: bool = False) -> bool:
+    if amount <= 0:
+        return True
+    from src.provider import get_whype_contract
+    whype = get_whype_contract(w3)
+    logger.info(f"Wrapping {amount / 1e18:.4f} HYPE to wHYPE")
+    tx = whype.functions.deposit().build_transaction({
+        **build_tx_params(w3, 100_000),
+        "value": amount,
+    })
+    receipt = send_transaction(w3, tx, dry_run)
+    return receipt is not None and receipt["status"] == 1
+
+
+@with_retry(max_retries=3, base_delay=2)
+def swap_exact_input_single(
+    w3: Web3,
+    token_in: str,
+    token_out: str,
+    fee: int,
+    amount_in: int,
+    dry_run: bool = False,
+) -> Optional[int]:
+    if amount_in <= 0:
+        return 0
+    from src.provider import get_swap_router_contract
+    router = get_swap_router_contract(w3)
+    account = get_account(w3)
+    deadline = build_deadline(w3)
+
+    logger.info(f"Swapping {amount_in / 1e18:.4f} tokenIn for tokenOut via fee={fee}")
+
+    tx = router.functions.exactInputSingle({
+        "tokenIn": Web3.to_checksum_address(token_in),
+        "tokenOut": Web3.to_checksum_address(token_out),
+        "fee": fee,
+        "recipient": account.address,
+        "deadline": deadline,
+        "amountIn": amount_in,
+        "amountOutMinimum": 0,
+        "sqrtPriceLimitX96": 0,
+    }).build_transaction(build_tx_params(w3, 300_000))
+
+    receipt = send_transaction(w3, tx, dry_run)
+    return None
+
+
+def balance_tokens(
+    w3: Web3,
+    pool_contract,
+    dry_run: bool = False,
+):
+    account = get_account(w3)
+    native_balance = w3.eth.get_balance(account.address)
+
+    # Wrap native HYPE to wHYPE, keeping small gas reserve
+    gas_reserve_wei = int(0.01 * 1e18)
+    wrap_amount = native_balance - gas_reserve_wei
+    if wrap_amount > 0:
+        wrap_hype(w3, wrap_amount, dry_run)
+
+    hype_bal, usdc_bal = get_token_balances(w3)
+    logger.info(
+        f"Balances: wHYPE={hype_bal / 10**config.HYPE_DECIMALS:.4f}, "
+        f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
+    )
+
+    if hype_bal == 0 and usdc_bal == 0:
+        logger.warning("No wHYPE or USDC available after wrapping")
+        return
+
+    # Simple 50/50 value balancing
+    if hype_bal > 0 and usdc_bal == 0:
+        slot0 = pool_contract.functions.slot0().call()
+        tick = slot0[1]
+        from src.provider import get_hype_contract
+        from src.math_utils import tick_to_price, get_token_order
+        token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+        invert = not token0_is_hype
+        price = tick_to_price(tick, dec0, dec1, invert)
+
+        half_value_in_hype = hype_bal // 2
+        logger.info(f"Swapping half wHYPE (~{half_value_in_hype / 1e18:.4f}) for USDC")
+
+        fee = pool_contract.functions.fee().call()
+        approve_token(
+            w3, get_hype_contract(w3),
+            Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS),
+            half_value_in_hype, dry_run,
+        )
+        swap_exact_input_single(
+            w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
+            fee, half_value_in_hype, dry_run,
+        )
+    elif usdc_bal > 0 and hype_bal == 0:
+        slot0 = pool_contract.functions.slot0().call()
+        tick = slot0[1]
+        from src.math_utils import tick_to_price, get_token_order
+        token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+        invert = not token0_is_hype
+        price = tick_to_price(tick, dec0, dec1, invert)
+
+        half_value_in_usdc = usdc_bal // 2
+        logger.info(f"Swapping half USDC (~${half_value_in_usdc / 1e6:.2f}) for wHYPE")
+
+        fee = pool_contract.functions.fee().call()
+        approve_token(
+            w3, get_hype_or_usdc(w3, False),
+            Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS),
+            half_value_in_usdc, dry_run,
+        )
+        swap_exact_input_single(
+            w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
+            fee, half_value_in_usdc, dry_run,
+        )
+    else:
+        logger.info("Both tokens present, skipping swap")
 
 
 def get_hype_or_usdc(w3: Web3, is_hype: bool):
