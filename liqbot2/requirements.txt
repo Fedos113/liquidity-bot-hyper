@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+aiosqlite
+web3
+python-dotenv

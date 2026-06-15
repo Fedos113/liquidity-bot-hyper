@@ -1,134 +1,121 @@
 
 # Liquidity Bot for Hyperliquid (HYPE/USDC)
 
-An automated concentrated liquidity provision bot for the Hyperliquid ecosystem, designed to manage HYPE/USDC liquidity positions. It automatically adjusts position bounds, compounds fees, and manages liquidity based on predefined parameters.
+An automated concentrated liquidity provision bot for HyperEVM, managing a HYPE/USDC position with automatic rebalancing. Includes a web dashboard for real-time monitoring.
 
 ## ⚠️ Disclaimer
 This bot interacts with real funds on the blockchain. **Use at your own risk.** Always test with `DRY_RUN=true` before deploying real capital. Never share your `.env` file or private keys.
 
 ---
 
-## 🚀 Quick Local Setup
+## Quick Local Setup
 
-### 1. Clone the Repository
+### 1. Clone and Install
 ```bash
 git clone https://github.com/Fedos113/liquidity-bot-hyper.git
 cd liquidity-bot-hyper
-```
-
-### 2. Create and Activate a Virtual Environment
-```bash
-# Create virtual environment
 python3 -m venv venv
-
-# Activate on macOS/Linux
-source venv/bin/activate
-
-# Activate on Windows
-venv\Scripts\activate
-```
-
-### 3. Install Dependencies
-```bash
+source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
-Copy the example environment file to create your local configuration:
+### 2. Configure Environment
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` in a text editor and configure the required variables:
+Edit `.env` with your RPC URL, private key, wallet address, and pool addresses. Key parameters:
 
-#### Required Variables
-```env
-RPC_URL=https://your-hyperliquid-rpc-url.com
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
-WALLET_ADDRESS=0xYOUR_WALLET_ADDRESS_HERE
-POOL_ADDRESS=0x6c9A33E3b592C0d65B3Ba59355d5Be0d38259285
-POSITION_MANAGER_ADDRESS=0xeaD19AE861c29bBb2101E834922B2FEee69B9091
-HYPE_ADDRESS=0x5555555555555555555555555555555555555555
-USDC_ADDRESS=0xb88339cb7199b77e23db6e890353e22632ba630f
-```
+| Variable | Default | Description |
+|---|---|---|
+| `TOKEN_ID` | `0` | `0` = auto-discover first active position on wallet |
+| `DRY_RUN` | `true` | Set `false` to execute real transactions |
+| `LOWER_BOUND_PCT` | `0.96` | Lower bound as fraction of current price |
+| `UPPER_BOUND_PCT` | `1.06` | Upper bound as fraction of current price |
+| `SLEEP_INTERVAL` | `3600` | Seconds between cycles (1h default) |
+| `SLIPPAGE_TOLERANCE` | `0.005` | 0.5% slippage tolerance |
 
-#### Bot Parameters & Configuration
-```env
-# Set to 0 to auto-create a position on the first run
-TOKEN_ID=0
-
-# Set to false ONLY when you are ready to execute real transactions
-DRY_RUN=true
-
-# Logging level: DEBUG, INFO, WARNING, ERROR
-LOG_LEVEL=INFO
-
-# Position bounds relative to current price
-LOWER_BOUND_PCT=0.96    # -4% from current price
-UPPER_BOUND_PCT=1.06    # +6% from current price
-
-# Bot execution interval (in seconds)
-SLEEP_INTERVAL=3600     # 1 hour
-
-# Trading parameters
-SLIPPAGE_TOLERANCE=0.005        # 0.5%
-FEE_COMPOUND_THRESHOLD_USD=5.0  # Min fee value (in USD) to trigger compounding
-
-# Token decimals (defaults are usually correct)
-HYPE_DECIMALS=18
-USDC_DECIMALS=6
-```
-
----
-
-## ⚙️ Usage
-
-### Running the Bot
-Ensure your virtual environment is activated, then start the bot:
+### 3. Start the Bot
 ```bash
 python main.py
 ```
 
-### Stopping the Bot
+The bot auto-starts the dashboard (Docker). Open **http://localhost:8000**.
 
-Press **`Ctrl+C`** to stop the bot gracefully. It will finish the current cycle and log a shutdown message before exiting.
+While the bot is sleeping, type **`skip` + Enter** to jump to the next cycle immediately.
 
----
-
-### Command Line Overrides
-You can override `.env` settings directly from the command line without editing the file:
-
+### 4. Start Dashboard Standalone
 ```bash
-# Force dry run mode (no real transactions will be sent)
-python main.py --dry-run
-
-# Change log level to DEBUG for detailed troubleshooting
-python main.py --log-level DEBUG
-
-# Combine arguments
-python main.py --dry-run --log-level DEBUG
+docker compose -f liqbot2/docker-compose.yml up -d --build
 ```
 
 ---
 
-## 📝 Logging
-The bot logs all activity to both the console and a file named `liqbot.log` in the root directory. 
+## Web Dashboard
 
-To monitor the bot's activity in real-time:
-```bash
-tail -f liqbot.log
+### Features
+- **Wallet & Position Value** — HYPE/USDC split + total portfolio
+- **Current Price** — live HYPE price from the pool
+- **P&L** — 24h, 7d, all-time in dollars (green/red)
+- **Impermanent Loss** — difference between LP value and HODL value (red = loss)
+- **Total Tx Fees** — cumulative gas costs in USD (from bot transactions only)
+- Manual **REFRESH** button — no auto-polling
+
+### Architecture
+```
+bot (main.py) ─── saves token_id & tx fees ──┐
+                                              ▼
+dashboard (liqbot2/) ←─ reads shared SQLite DB ←─ chain RPC
+├── main.py       FastAPI endpoints (/refresh, /, /chart)
+├── db.py         SQLite schema + async helpers
+├── metrics.py    Position value, IL, PNL computations
+├── index.html    Dark-themed UI (Chart.js)
+├── Dockerfile    python:3.12-slim
+└── docker-compose.yml
 ```
 
 ---
 
-## 🔒 Security Best Practices
-- **Never commit your `.env` file.** It is already excluded via `.gitignore`.
-- Use a dedicated wallet for the bot with only the funds you intend to provide as liquidity.
-- Keep your `PRIVATE_KEY` secure and never share it.
-- Regularly check `liqbot.log` to ensure the bot is behaving as expected.
+## How the Bot Works
+
+Each cycle (every `SLEEP_INTERVAL` seconds):
+
+1. **Check position** — auto-discover via ERC721 `balanceOf`/`tokenOfOwnerByIndex`, filter for active liquidity (`liquidity > 0`). Falls back to `TOKEN_ID` from env.
+2. **Fetch pool state** — `slot0` (sqrt price, tick), token balances, fee growth
+3. **Collect fees** — harvest accrued HYPE/USDC from the position
+4. **Decide rebalance** — compare current price to bounds; rebalance if outside
+5. **Pre-mint ratio loop** — iteratively swap the excess token to match the pool's HYPE/USDC ratio within 1%
+6. **Mint / increase liquidity** — create or add to the position
+7. **Post-mint top-up** — swap leftover imbalance, increase liquidity again
+8. **Record snapshot** — save wallet balances, position data, price to SQLite
+9. **Skip support** — listens for `skip` + Enter during sleep to restart cycle
 
 ---
 
-## 📄 License
+## Key Design Decisions
+- Pre-mint iterative swap (instead of post-mint): avoids `increase_liquidity` slippage checks
+- Auto-discovery scans all wallet NFTs for matching pool + active liquidity; burns are ignored
+- PNL baseline skips zero-liquidity snapshots (wallet-only) when a position exists
+- Dashboard reads price from a dedicated `price` column (not recomputed from tick) for correct IL math
+- Tx fees in gas token (HYPE) converted to USD using live pool price
 
-This project is proprietary. See [LICENSE](LICENSE) for details.
+---
+
+## Configuration
+
+**Swap / Rebalance behavior:** The `swap_frac` is capped at `min(0.50, 10.0 / excess_usd)` to avoid overshooting. Each pre-mint swap moves only the **excess** token amount (above the target ratio), not the entire balance.
+
+**Bounds convention:** `LOWER_BOUND_PCT=0.96` means the position's lower tick is set at 96% of the current price. The bot rebalances when the price exits this range.
+
+---
+
+## Security Best Practices
+- Never commit your `.env` file (`.gitignore` already excludes it)
+- Use a dedicated wallet with only the funds you intend to provide
+- Keep your `PRIVATE_KEY` secure
+- Monitor `liqbot.log` and the dashboard regularly
+
+---
+
+## License
+Proprietary. See [LICENSE](LICENSE) for details.
