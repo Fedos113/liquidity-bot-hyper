@@ -334,28 +334,26 @@ def rebalance(
         am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
         if am0_opt <= 0 or am1_opt <= 0:
             break
-        leftover0 = raw0 - am0_opt
-        leftover1 = raw1 - am1_opt
 
-        if leftover0 > 0 and leftover1 > 0:
+        leftover0_usd = (raw0 - am0_opt) * current_price / 10**config.HYPE_DECIMALS if token0_is_hype else (raw0 - am0_opt) / 10**config.USDC_DECIMALS
+        leftover1_usd = (raw1 - am1_opt) * current_price / 10**config.HYPE_DECIMALS if not token0_is_hype else (raw1 - am1_opt) / 10**config.USDC_DECIMALS
+
+        if leftover0_usd <= max_retain_usd and leftover1_usd <= max_retain_usd:
             break
 
-        if leftover0 > 0:
+        if leftover0_usd > leftover1_usd:
             if token0_is_hype:
-                leftover_usd = (leftover0 / 10**config.HYPE_DECIMALS) * current_price
                 decimals_in = config.HYPE_DECIMALS
+                retain_raw = int((min_retain_usd / current_price) * 10**decimals_in)
             else:
-                leftover_usd = leftover0 / 10**config.USDC_DECIMALS
                 decimals_in = config.USDC_DECIMALS
-            if leftover_usd <= max_retain_usd:
-                break
-            retain_raw = int((min_retain_usd / (current_price if token0_is_hype else 1)) * 10**decimals_in)
-            swap_raw = leftover0 - retain_raw
+                retain_raw = int(min_retain_usd * 10**decimals_in)
+            swap_raw = (raw0 - am0_opt) - retain_raw
             if swap_raw <= 0:
                 break
             token_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
             token_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-            logger.info(f"Swapping excess token0 ({leftover_usd:.2f}$) -> keeping ~${min_retain_usd}")
+            logger.info(f"Swapping excess token0 (${leftover0_usd:.2f}) -> keeping ~${min_retain_usd}")
             approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
                           config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
             swap_exact_input_single(w3, token_in, token_out, pool_fee, swap_raw, dry_run)
@@ -363,22 +361,19 @@ def rebalance(
             raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
             continue
 
-        if leftover1 > 0:
+        if leftover1_usd > leftover0_usd:
             if not token0_is_hype:
-                leftover_usd = (leftover1 / 10**config.HYPE_DECIMALS) * current_price
                 decimals_in = config.HYPE_DECIMALS
+                retain_raw = int((min_retain_usd / current_price) * 10**decimals_in)
             else:
-                leftover_usd = leftover1 / 10**config.USDC_DECIMALS
                 decimals_in = config.USDC_DECIMALS
-            if leftover_usd <= max_retain_usd:
-                break
-            retain_raw = int((min_retain_usd / (current_price if not token0_is_hype else 1)) * 10**decimals_in)
-            swap_raw = leftover1 - retain_raw
+                retain_raw = int(min_retain_usd * 10**decimals_in)
+            swap_raw = (raw1 - am1_opt) - retain_raw
             if swap_raw <= 0:
                 break
             token_in = config.HYPE_ADDRESS if not token0_is_hype else config.USDC_ADDRESS
             token_out = config.USDC_ADDRESS if not token0_is_hype else config.HYPE_ADDRESS
-            logger.info(f"Swapping excess token1 ({leftover_usd:.2f}$) -> keeping ~${min_retain_usd}")
+            logger.info(f"Swapping excess token1 (${leftover1_usd:.2f}) -> keeping ~${min_retain_usd}")
             approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
                           config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
             swap_exact_input_single(w3, token_in, token_out, pool_fee, swap_raw, dry_run)
