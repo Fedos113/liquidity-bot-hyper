@@ -25,8 +25,16 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
     if receipt["status"] == 1:
         logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {receipt['gasUsed']})")
     else:
-        logger.error(f"Tx reverted: {tx_hash.hex()}")
-        raise ValueError(f"Transaction reverted: {tx_hash.hex()}")
+        revert_reason = ""
+        try:
+            w3.eth.call(tx, block_identifier=receipt["blockNumber"])
+        except Exception as e:
+            revert_reason = str(e)
+        msg = f"Transaction reverted: {tx_hash.hex()}"
+        if revert_reason:
+            msg += f". Reason: {revert_reason}"
+        logger.error(msg)
+        raise ValueError(msg)
 
     return receipt
 
@@ -285,7 +293,10 @@ def rebalance(
     logger.info("Step 3: Collecting remaining fees...")
     collect_fees(w3, position_manager, token_id, dry_run)
 
-    logger.info("Step 4: Calculating new bounds...")
+    logger.info("Step 4: Balancing tokens...")
+    balance_tokens(w3, pool_contract, dry_run)
+
+    logger.info("Step 5: Calculating new bounds...")
     tick_lower, tick_upper, actual_lower, actual_upper = calculate_bounds(
         current_price, config.LOWER_BOUND_PCT, config.UPPER_BOUND_PCT,
         dec0, dec1, tick_spacing, invert,
@@ -301,18 +312,25 @@ def rebalance(
         f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
     )
 
-    if token0_is_hype:
-        amount0_desired = hype_bal
-        amount1_desired = usdc_bal
-    else:
-        amount0_desired = usdc_bal
-        amount1_desired = hype_bal
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    from src.math_utils import calculate_token_amounts
 
-    if amount0_desired == 0 and amount1_desired == 0:
+    if token0_is_hype:
+        raw0, raw1 = hype_bal, usdc_bal
+    else:
+        raw0, raw1 = usdc_bal, hype_bal
+
+    if raw0 == 0 and raw1 == 0:
         logger.warning("No tokens available to mint new position")
         return None
 
-    logger.info("Step 5: Approving tokens...")
+    am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+    amount0_desired = max(am0_opt, 1)
+    amount1_desired = max(am1_opt, 1)
+    logger.info(f"Optimal amounts: {amount0_desired} t0, {amount1_desired} t1")
+
+    logger.info("Step 6: Approving tokens...")
     hype_con = get_hype_or_usdc(w3, True)
     usdc_con = get_hype_or_usdc(w3, False)
     pm_addr = config.POSITION_MANAGER_ADDRESS
@@ -325,7 +343,7 @@ def rebalance(
         approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
 
     pool_fee = pool_contract.functions.fee().call()
-    logger.info(f"Step 6: Minting new position (fee tier: {pool_fee})...")
+    logger.info(f"Step 7: Minting new position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
         w3, position_manager, pool_contract,
         tick_lower, tick_upper, amount0_desired, amount1_desired,
