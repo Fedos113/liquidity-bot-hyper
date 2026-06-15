@@ -72,7 +72,6 @@ SLEEP_INTERVAL=3600     # 1 hour
 
 # Trading parameters
 SLIPPAGE_TOLERANCE=0.005        # 0.5%
-FEE_TIER=3000                   # 0.3% fee tier
 FEE_COMPOUND_THRESHOLD_USD=5.0  # Min fee value (in USD) to trigger compounding
 
 # Token decimals (defaults are usually correct)
@@ -89,6 +88,12 @@ Ensure your virtual environment is activated, then start the bot:
 ```bash
 python main.py
 ```
+
+### Stopping the Bot
+
+Press **`Ctrl+C`** to stop the bot gracefully. It will finish the current cycle and log a shutdown message before exiting.
+
+---
 
 ### Command Line Overrides
 You can override `.env` settings directly from the command line without editing the file:
