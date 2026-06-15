@@ -11,6 +11,23 @@ from src.math_utils import get_tick_spacing, get_token_order, calculate_bounds, 
 logger = logging.getLogger("liqbot")
 
 
+def _record_tx_fee(tx_hash: str, fee_wei: int):
+    try:
+        import sqlite3
+        from pathlib import Path
+        db_path = Path(__file__).resolve().parent.parent / "liqbot2" / "data" / "history.db"
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "INSERT INTO tx_fees (ts, tx_hash, fee_wei, description) VALUES (?, ?, ?, ?)",
+                (int(__import__('time').time()), tx_hash, fee_wei, "tx"),
+            )
+            conn.commit()
+            conn.close()
+    except Exception:
+        pass
+
+
 def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxReceipt]:
     if dry_run:
         logger.info(f"[DRY-RUN] Would send tx: from={tx['from']} nonce={tx['nonce']}")
@@ -24,6 +41,7 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
 
     if receipt["status"] == 1:
         logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {receipt['gasUsed']})")
+        _record_tx_fee(tx_hash.hex(), receipt["gasUsed"] * tx.get("gasPrice", 0))
     else:
         revert_reason = ""
         try:
