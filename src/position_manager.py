@@ -325,10 +325,72 @@ def rebalance(
         logger.warning("No tokens available to mint new position")
         return None
 
-    am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+    pool_fee = pool_contract.functions.fee().call()
+
+    # Optimize: swap excess of non-limiting token to the other side for ~full utilization
+    max_retain_usd = 5.0
+    min_retain_usd = 2.0
+    for _ in range(2):
+        am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+        if am0_opt <= 0 or am1_opt <= 0:
+            break
+        leftover0 = raw0 - am0_opt
+        leftover1 = raw1 - am1_opt
+
+        if leftover0 > 0 and leftover1 > 0:
+            break
+
+        if leftover0 > 0:
+            if token0_is_hype:
+                leftover_usd = (leftover0 / 10**config.HYPE_DECIMALS) * current_price
+                decimals_in = config.HYPE_DECIMALS
+            else:
+                leftover_usd = leftover0 / 10**config.USDC_DECIMALS
+                decimals_in = config.USDC_DECIMALS
+            if leftover_usd <= max_retain_usd:
+                break
+            retain_raw = int((min_retain_usd / (current_price if token0_is_hype else 1)) * 10**decimals_in)
+            swap_raw = leftover0 - retain_raw
+            if swap_raw <= 0:
+                break
+            token_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+            token_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+            logger.info(f"Swapping excess token0 ({leftover_usd:.2f}$) -> keeping ~${min_retain_usd}")
+            approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                          config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+            swap_exact_input_single(w3, token_in, token_out, pool_fee, swap_raw, dry_run)
+            hype_bal, usdc_bal = get_token_balances(w3)
+            raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+            continue
+
+        if leftover1 > 0:
+            if not token0_is_hype:
+                leftover_usd = (leftover1 / 10**config.HYPE_DECIMALS) * current_price
+                decimals_in = config.HYPE_DECIMALS
+            else:
+                leftover_usd = leftover1 / 10**config.USDC_DECIMALS
+                decimals_in = config.USDC_DECIMALS
+            if leftover_usd <= max_retain_usd:
+                break
+            retain_raw = int((min_retain_usd / (current_price if not token0_is_hype else 1)) * 10**decimals_in)
+            swap_raw = leftover1 - retain_raw
+            if swap_raw <= 0:
+                break
+            token_in = config.HYPE_ADDRESS if not token0_is_hype else config.USDC_ADDRESS
+            token_out = config.USDC_ADDRESS if not token0_is_hype else config.HYPE_ADDRESS
+            logger.info(f"Swapping excess token1 ({leftover_usd:.2f}$) -> keeping ~${min_retain_usd}")
+            approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                          config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+            swap_exact_input_single(w3, token_in, token_out, pool_fee, swap_raw, dry_run)
+            hype_bal, usdc_bal = get_token_balances(w3)
+            raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+            continue
+
+        break
+
     amount0_desired = max(am0_opt, 1)
     amount1_desired = max(am1_opt, 1)
-    logger.info(f"Optimal amounts: {amount0_desired} t0, {amount1_desired} t1")
+    logger.info(f"Final amounts: {amount0_desired} t0, {amount1_desired} t1")
 
     logger.info("Step 6: Approving tokens...")
     hype_con = get_hype_or_usdc(w3, True)
@@ -342,7 +404,6 @@ def rebalance(
         approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
         approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
 
-    pool_fee = pool_contract.functions.fee().call()
     logger.info(f"Step 7: Minting new position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
         w3, position_manager, pool_contract,
