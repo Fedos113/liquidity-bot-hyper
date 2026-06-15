@@ -1,6 +1,6 @@
 import logging
 import signal
-import sys
+import threading
 from time import sleep, time
 
 from src.config import config
@@ -168,28 +168,25 @@ def run_bot():
         remaining = config.SLEEP_INTERVAL - elapsed
         if remaining > 0 and running:
             logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s... (type 'skip' + Enter to start next cycle now)")
-            if sys.platform == "win32":
-                import msvcrt
-                for _ in range(int(remaining)):
-                    if not running:
-                        break
-                    if msvcrt.kbhit():
-                        chars = []
-                        while msvcrt.kbhit():
-                            c = msvcrt.getwche()
-                            if c == '\r':
-                                break
-                            chars.append(c)
-                        cmd = ''.join(chars).strip().lower()
-                        if cmd == "skip":
-                            print()
-                            logger.info("Skip received, starting next cycle...")
+            import sys
+            skip_flag = threading.Event()
+            def stdin_listener():
+                try:
+                    while True:
+                        line = sys.stdin.readline()
+                        if not line:
                             break
-                    sleep(1)
-            else:
-                for _ in range(int(remaining)):
-                    if not running:
-                        break
-                    sleep(1)
+                        if line.strip().lower() == "skip":
+                            skip_flag.set()
+                            break
+                except (EOFError, OSError):
+                    pass
+            threading.Thread(target=stdin_listener, daemon=True).start()
+            for _ in range(int(remaining)):
+                if not running or skip_flag.is_set():
+                    break
+                sleep(1)
+            if skip_flag.is_set():
+                logger.info("Skip received, starting next cycle...")
 
     logger.info("Bot stopped.")
