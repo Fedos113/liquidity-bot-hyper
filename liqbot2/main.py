@@ -65,18 +65,32 @@ def _find_position(w3, pm, pool):
             "token0": raw[2], "token1": raw[3],
             "fee": raw[4], "tickLower": raw[5],
             "tickUpper": raw[6], "liquidity": raw[7],
-            "amount0": raw[8], "amount1": raw[9],
-            "amount0Collect": raw[10], "amount1Collect": raw[11],
+            "feeGrowthInside0LastX128": raw[8], "feeGrowthInside1LastX128": raw[9],
+            "tokensOwed0": raw[10], "tokensOwed1": raw[11],
         }
 
-    tid_file = Path(__file__).resolve().parent / "data" / "token_id.txt"
-    if tid_file.exists():
+    data_dir = Path(__file__).resolve().parent / "data"
+    meta_file = data_dir / "position_meta.json"
+    saved_tid = 0
+    if meta_file.exists():
         try:
-            saved_tid = int(tid_file.read_text().strip())
-            if saved_tid > 0:
-                raw = pm.functions.positions(saved_tid).call()
-                if raw[2].lower() == pool_t0 and raw[3].lower() == pool_t1 and raw[7] > 0:
-                    return _build(saved_tid, raw)
+            import json
+            meta = json.loads(meta_file.read_text())
+            saved_tid = meta.get("token_id", 0)
+        except Exception:
+            pass
+    if not saved_tid:
+        tid_file = data_dir / "token_id.txt"
+        if tid_file.exists():
+            try:
+                saved_tid = int(tid_file.read_text().strip())
+            except Exception:
+                pass
+    if saved_tid > 0:
+        try:
+            raw = pm.functions.positions(saved_tid).call()
+            if raw[2].lower() == pool_t0 and raw[3].lower() == pool_t1 and raw[7] > 0:
+                return _build(saved_tid, raw)
         except Exception:
             pass
 
