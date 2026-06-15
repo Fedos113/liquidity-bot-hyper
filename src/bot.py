@@ -1,6 +1,5 @@
 import logging
 import signal
-import subprocess
 import threading
 from pathlib import Path
 from time import sleep, time
@@ -37,40 +36,12 @@ def signal_handler(sig, frame):
     running = False
 
 
-def _compose_file():
-    return str(Path(__file__).resolve().parent.parent / "liqbot2" / "docker-compose.yml")
-
-
 def _save_token_id(token_id: int):
     try:
         p = Path(__file__).resolve().parent.parent / "liqbot2" / "data" / "token_id.txt"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(str(token_id))
     except Exception:
-        pass
-
-
-def _start_dashboard():
-    try:
-        subprocess.run(
-            ["docker", "compose", "-f", _compose_file(), "up", "-d"],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-        logger.info("Dashboard started at http://localhost:8000")
-    except FileNotFoundError:
-        logger.warning("Docker not found, skipping dashboard start")
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Dashboard start failed: {e.stderr.strip()}")
-
-
-def _stop_dashboard():
-    try:
-        subprocess.run(
-            ["docker", "compose", "-f", _compose_file(), "down"],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-        logger.info("Dashboard stopped")
-    except (FileNotFoundError, subprocess.CalledProcessError):
         pass
 
 
@@ -89,7 +60,6 @@ def run_bot():
         logger.info("=" * 50)
 
     logger.info("Starting HYPE/USDC Liquidity Bot")
-    _start_dashboard()
     logger.info(
         f"SLEEP_INTERVAL={config.SLEEP_INTERVAL}s, "
         f"LOWER={config.LOWER_BOUND_PCT}, UPPER={config.UPPER_BOUND_PCT}"
@@ -231,5 +201,4 @@ def run_bot():
             if skip_flag.is_set():
                 logger.info("Skip received, starting next cycle...")
 
-    _stop_dashboard()
     logger.info("Bot stopped.")
