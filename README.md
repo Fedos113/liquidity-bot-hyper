@@ -121,3 +121,9 @@ tail -f liqbot.log
 - Use a dedicated wallet for the bot with only the funds you intend to provide as liquidity.
 - Keep your `PRIVATE_KEY` secure and never share it.
 - Regularly check `liqbot.log` to ensure the bot is behaving as expected.
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
