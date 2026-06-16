@@ -213,9 +213,10 @@ class Backtest:
         self.adds = 0
         self.swaps = 0
         self.secondary_triggers = 0
-        self.history: list[tuple[int, float, float, float, float, float]] = []
-        self._add_to_position_call_count = 0
-        self._compound_fees_call_count = 0
+        self.history: list[tuple[int, float, float, float, float, float, float, float]] = []
+        self._compound_attempts = 0
+        self._successful_compounds = 0
+        self._add_calls = 0
 
     # -- helpers -----------------------------------------------------------
 
@@ -240,7 +241,7 @@ class Backtest:
         """Accrue fees for the current step and compound into the position."""
         if self.pos is None or self.pos.liquidity == 0:
             return
-        self._compound_fees_call_count += 1
+        self._compound_attempts += 1
 
         tick = price_to_tick(price)
         in_range = self.pos.tick_lower <= tick < self.pos.tick_upper
@@ -253,42 +254,32 @@ class Backtest:
         if fee_usd <= 0:
             return
 
-        dec0, dec1 = BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS
+        # Add liquidity proportional to the fee rate (avoids precision loss
+        # from splitting tiny USD amounts across tokens with different decimals).
+        add_liq = int(self.pos.liquidity * self.hourly_fee_rate)
+        if add_liq <= 0:
+            return
+
+        self._successful_compounds += 1
+        self.pos.liquidity += add_liq
+        self.fees_collected_usd += fee_usd
+
+        # Derive raw fee amounts from the added liquidity, then sync
+        # fee-growth trackers so these fees are not double-collected on removal.
         spl = math.sqrt(1.0001 ** self.pos.tick_lower)
         spu = math.sqrt(1.0001 ** self.pos.tick_upper)
         sp = sqrt_p / Q96
 
-        val_per_liq_0 = (spu - sp) / (sp * spu) * price / (10 ** dec0)
-        val_per_liq_1 = (sp - spl) / (10 ** dec1)
-        total_vpl = val_per_liq_0 + val_per_liq_1
-        if total_vpl <= 0:
+        if sp <= spl or sp >= spu:
             return
 
-        # Split fee USD into token amounts
-        fee_tok0_usd = fee_usd * val_per_liq_0 / total_vpl
-        fee_tok1_usd = fee_usd * val_per_liq_1 / total_vpl
-        fee0_raw = int(fee_tok0_usd / price * (10 ** dec0)) if fee_tok0_usd > 0 else 0
-        fee1_raw = int(fee_tok1_usd * (10 ** dec1)) if fee_tok1_usd > 0 else 0
+        fee0_raw = int(add_liq * (spu - sp) / (sp * spu))
+        fee1_raw = int(add_liq * (sp - spl))
 
-        if fee0_raw <= 0 and fee1_raw <= 0:
-            return
-
-        # Calculate how much new liquidity the fee tokens provide
-        add_liq = liquidity_from_amounts(
-            fee0_raw, fee1_raw, sqrt_p,
-            self.pos.tick_lower, self.pos.tick_upper,
-        )
-        if add_liq <= 0:
-            return
-
-        # Compound: add liquidity to the position (fees are now part of the position)
-        self.pos.liquidity += add_liq
-        self.fees_collected_usd += fee_usd
-
-        # Sync the fee-growth trackers so these fees are NOT collected again on removal
         Q128 = 1 << 128
-        dg0 = int(fee0_raw * Q128 / (self.pos.liquidity - add_liq)) if (fee0_raw > 0 and self.pos.liquidity > add_liq) else 0
-        dg1 = int(fee1_raw * Q128 / (self.pos.liquidity - add_liq)) if (fee1_raw > 0 and self.pos.liquidity > add_liq) else 0
+        pre_liq = self.pos.liquidity - add_liq
+        dg0 = int(fee0_raw * Q128 / pre_liq) if (fee0_raw > 0 and pre_liq > 0) else 0
+        dg1 = int(fee1_raw * Q128 / pre_liq) if (fee1_raw > 0 and pre_liq > 0) else 0
         self._fee_growth_global_0 += dg0
         self._fee_growth_global_1 += dg1
         self.pos.fee_growth_0_last = self._fee_growth_global_0
@@ -336,7 +327,7 @@ class Backtest:
             denom = 1.0 + target_ratio / p
             swap_raw = max(0, int(num / denom * 0.99))
             if swap_raw >= 1000:
-                dec_swap = BOT_USDC_DECIMALS if not self.token0_is_hype else BOT_HYPE_DECIMALS
+                dec_swap = BOT_USDC_DECIMALS if self.token0_is_hype else BOT_HYPE_DECIMALS
                 amt = swap_raw / (10 ** dec_swap)
                 if self.token0_is_hype:
                     if amt > self.usdc:
@@ -448,7 +439,7 @@ class Backtest:
             return
         if self._wallet_val(price) < BOT_WALLET_MIN:
             return
-        self._add_to_position_call_count += 1
+        self._add_calls += 1
 
         self._optimize_ratio(price)
 
@@ -494,9 +485,12 @@ class Backtest:
         for idx, (ts, price) in enumerate(prices):
             if idx == 0:
                 sqrt_p = sqrt_price_x96_from_price(price)
+                pos_val = self._pos_val(price, sqrt_p) if self.pos else 0.0
                 self.history.append((ts, price, self.hype, self.usdc,
+                                     pos_val,
                                      self.pos.liquidity if self.pos else 0,
-                                     self._total_val(price, sqrt_p)))
+                                     self._total_val(price, sqrt_p),
+                                     self.fees_collected_usd))
                 continue
 
             # 1. Fee compounding (happens every step when in range)
@@ -557,9 +551,12 @@ class Backtest:
 
             # Record every step for full granularity
             sqrt_p = sqrt_price_x96_from_price(price)
+            pos_val = self._pos_val(price, sqrt_p) if self.pos else 0.0
             self.history.append((ts, price, self.hype, self.usdc,
+                                 pos_val,
                                  self.pos.liquidity if self.pos else 0,
-                                 self._total_val(price, sqrt_p)))
+                                 self._total_val(price, sqrt_p),
+                                 self.fees_collected_usd))
 
         # Final valuation: close any open position
         final_price = prices[-1][1]
@@ -588,8 +585,9 @@ class Backtest:
             "adds": self.adds,
             "swaps": self.swaps,
             "secondary_triggers": self.secondary_triggers,
-            "compound_fees_calls": self._compound_fees_call_count,
-            "add_to_position_calls": self._add_to_position_call_count,
+            "compound_attempts": self._compound_attempts,
+            "compound_success": self._successful_compounds,
+            "add_calls": self._add_calls,
             "steps": len(self.history),
             "history": self.history,
         }
@@ -657,14 +655,15 @@ def main():
     print(f"  Swaps:            {result['swaps']}")
     print(f"  Anti-IL triggers: {result['secondary_triggers']}")
     print(f"  Fees earned:      ${result['fees_earned']:.2f}")
-    print(f"  DEBUG: compound_fees_calls={result['compound_fees_calls']}, add_to_position_calls={result['add_to_position_calls']}")
+    print(f"  Fee events:       {result['compound_success']} in-range compoundings out of {result['compound_attempts']} attempts")
     print(sep)
 
     if args.output:
         with open(args.output, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["timestamp", "price", "hype_bal", "usdc_bal",
-                         "position_liquidity", "total_value_usd"])
+                         "position_value_usd", "position_liquidity", "total_value_usd",
+                         "fees_collected_usd"])
             for row in result["history"]:
                 w.writerow(row)
         logger.info(f"Full {result['steps']}-row history saved to {args.output}")
