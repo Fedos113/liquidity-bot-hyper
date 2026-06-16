@@ -3,8 +3,11 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncio
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 import aiosqlite
 
@@ -17,7 +20,7 @@ from src.position_manager import get_position_details, get_token_balances
 
 load_dotenv()
 
-from liqbot2.db import init_db, get_snapshots
+from liqbot2.db import init_db, get_snapshots, get_net_deposits_batch, insert_deposit
 from liqbot2.metrics import compute_all
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "history.db"
@@ -28,7 +31,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     app.state.db = await aiosqlite.connect(DB_PATH)
     app.state.db.row_factory = aiosqlite.Row
+    task = asyncio.create_task(_hourly_refresh(app.state.db))
     yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     await app.state.db.close()
 
 
@@ -108,8 +117,17 @@ def _find_position(w3, pm, pool):
     return None, None
 
 
-@app.post("/refresh")
-async def refresh():
+async def _hourly_refresh(db):
+    await asyncio.sleep(3600)
+    while True:
+        try:
+            await _do_refresh(db)
+        except Exception as e:
+            print(f"[hourly refresh] failed: {e}")
+        await asyncio.sleep(3600)
+
+
+async def _do_refresh(db):
     w3 = get_web3()
     pool = get_pool_contract(w3)
     pm = get_position_manager_contract(w3)
@@ -129,16 +147,53 @@ async def refresh():
     tick_lower = pos["tickLower"] if pos and pos["liquidity"] > 0 else None
     tick_upper = pos["tickUpper"] if pos and pos["liquidity"] > 0 else None
 
-    result = await compute_all(
-        app.state.db, pos, hype_bal, usdc_bal, current_price, sqrt_price_x96,
+    return await compute_all(
+        db, pos, hype_bal, usdc_bal, current_price, sqrt_price_x96,
         token0_is_hype, dec0, dec1, current_tick, config.WALLET_ADDRESS,
         tick_lower, tick_upper,
     )
 
-    return result
+
+@app.post("/deposit")
+async def record_deposit(
+    type: str = Query(..., description="deposit or withdrawal"),
+    usd_value: float = Query(..., description="USD value of the deposit/withdrawal"),
+    description: str = Query(""),
+):
+    ts = int(datetime.now(timezone.utc).timestamp())
+    await insert_deposit(app.state.db, ts, type, usd_value, description)
+    return {"status": "ok"}
+
+
+@app.post("/refresh")
+async def refresh():
+    return await _do_refresh(app.state.db)
 
 
 @app.get("/chart")
-async def chart():
-    rows = await get_snapshots(app.state.db)
-    return {"timestamps": [r["ts"] for r in rows], "values": [r["value"] for r in rows]}
+async def chart(period: str = "24h"):
+    now = int(datetime.now(timezone.utc).timestamp())
+    cutoff = None
+    if period == "24h":
+        cutoff = now - 86400
+    elif period == "7d":
+        cutoff = now - 604800
+
+    rows = await get_snapshots(app.state.db, cutoff)
+    if not rows or len(rows) < 2:
+        return {"labels": [], "pnl": []}
+
+    all_ts = [r["ts"] for r in rows]
+    net_dep_map = await get_net_deposits_batch(app.state.db, all_ts)
+
+    first_ts = all_ts[0]
+    first_adjusted = rows[0]["value"] - net_dep_map.get(first_ts, 0)
+
+    labels = []
+    pnl = []
+    for r in rows:
+        adjusted = r["value"] - net_dep_map.get(r["ts"], 0)
+        pnl.append(round(adjusted - first_adjusted, 2))
+        labels.append(r["ts"])
+
+    return {"labels": labels, "pnl": pnl}
