@@ -176,6 +176,7 @@ def run_bot():
 
     while running:
         cycle_error = False
+        position_minted = False
         cycle_start = time()
         logger.info("=" * 50)
         logger.info(f"Cycle start: {cycle_start}")
@@ -243,6 +244,7 @@ def run_bot():
                                     token_id = new_id
                                     token_id_ref[0] = new_id
                                     config.TOKEN_ID = new_id
+                                    position_minted = True
                                     logger.info(f"Created new position ID {token_id}")
                             else:
                                 logger.info("Position in range and active.")
@@ -282,6 +284,7 @@ def run_bot():
                                 token_id = new_id
                                 token_id_ref[0] = new_id
                                 config.TOKEN_ID = new_id
+                                position_minted = True
                                 logger.info(f"Created new position ID {token_id}")
                     else:
                         logger.info("No active position found. Creating new position...")
@@ -289,6 +292,7 @@ def run_bot():
                         if new_id is not None:
                             token_id = new_id
                             token_id_ref[0] = new_id
+                            position_minted = True
                         config.TOKEN_ID = new_id
                         logger.info(f"Created position ID {token_id}")
             except TxFeeExceeded as e:
@@ -300,7 +304,7 @@ def run_bot():
             cycle_error = True
 
         elapsed = time() - cycle_start
-        remaining = 60 if cycle_error else config.SLEEP_INTERVAL - elapsed
+        remaining = 60 if cycle_error or position_minted else config.SLEEP_INTERVAL - elapsed
         cycle_error = False
         if remaining > 0 and running:
             logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s... (type 'skip' + Enter to start next cycle now)")
