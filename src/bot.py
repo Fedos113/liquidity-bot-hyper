@@ -1,7 +1,6 @@
 import logging
 import signal
 import threading
-from pathlib import Path
 from time import sleep, time
 
 from src.config import config
@@ -41,17 +40,6 @@ def signal_handler(sig, frame):
     global running
     logger.info("Shutdown signal received, stopping after current cycle...")
     running = False
-
-
-def _save_position_meta(token_id: int, pool_address: str = ""):
-    try:
-        import json
-        p = Path(__file__).resolve().parent.parent / "liqbot2" / "data" / "position_meta.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        data = {"token_id": token_id, "pool_address": pool_address or config.POOL_ADDRESS}
-        p.write_text(json.dumps(data))
-    except Exception:
-        pass
 
 
 def _secondary_cycle():
@@ -187,7 +175,6 @@ def run_bot():
                     token_id = new_id
                     token_id_ref[0] = new_id
                     config.TOKEN_ID = new_id
-                    _save_position_meta(new_id, config.POOL_ADDRESS)
 
             with tx_lock:
                 if pos and pos["liquidity"] > 0:
@@ -224,7 +211,6 @@ def run_bot():
                                 token_id = new_id
                                 token_id_ref[0] = new_id
                                 config.TOKEN_ID = new_id
-                                _save_position_meta(new_id, config.POOL_ADDRESS)
                                 logger.info(f"Created new position ID {token_id}")
                         else:
                             logger.info("Position in range and active.")
@@ -264,7 +250,6 @@ def run_bot():
                             token_id = new_id
                             token_id_ref[0] = new_id
                             config.TOKEN_ID = new_id
-                            _save_position_meta(new_id, config.POOL_ADDRESS)
                             logger.info(f"Created new position ID {token_id}")
                 else:
                     logger.info("No active position found. Creating new position...")
@@ -272,9 +257,8 @@ def run_bot():
                     if new_id is not None:
                         token_id = new_id
                         token_id_ref[0] = new_id
-                        config.TOKEN_ID = new_id
-                        _save_position_meta(new_id, config.POOL_ADDRESS)
-                        logger.info(f"Created position ID {token_id}")
+                    config.TOKEN_ID = new_id
+                    logger.info(f"Created position ID {token_id}")
 
         except Exception as e:
             logger.warning(f"Cycle error, retrying in 60s: {e}")
