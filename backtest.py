@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-backtest.py — Simulate the HYPE/USDC liquidity bot over historical price data.
+backtest.py -- Simulate the HYPE/USDC liquidity bot over historical price data.
 
-Uses the bot's own math utilities and mirrors its exact decision logic.
+Simulates every price point at hourly granularity with per-step fee compounding.
 
 Usage:
-  python backtest.py --initial-hype 10 --initial-usdc 200 --fee-apr 0.15
+  python backtest.py --initial-hype 10 --initial-usdc 200
   python backtest.py --csv prices.csv
-  python backtest.py --days 300
+  python backtest.py --days 300 --output results.csv
 """
 
 import argparse
@@ -23,10 +23,8 @@ sys.path.insert(0, ".")
 
 from src.math_utils import (
     calculate_bounds,
-    get_price_from_sqrt_price,
     position_value_usd,
     tick_to_price,
-    price_to_tick,
 )
 from src.constants import Q96, TICK_SPACINGS
 
@@ -37,12 +35,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backtest")
 
+# -- Bot constants (mirrors src/config.py defaults) -------------------------
+
 BOT_LOWER_BOUND_PCT = 0.96
 BOT_UPPER_BOUND_PCT = 1.06
 BOT_FEE_TIER = 3000
 BOT_TICK_SPACING = TICK_SPACINGS[BOT_FEE_TIER]
-BOT_SLIPPAGE = 0.005
-BOT_FEE_COMPOUND_THRESHOLD = 5.0
 BOT_HYPE_DROP_THRESHOLD = 0.98
 BOT_SECONDARY_INTERVAL = 600
 BOT_SLEEP_INTERVAL = 3600
@@ -51,34 +49,114 @@ BOT_USDC_DECIMALS = 6
 BOT_SWAP_FEE = 0.003
 BOT_WALLET_MIN = 0.2
 
-# ── Price data ──────────────────────────────────────────────────────────
+# -- Helpers ----------------------------------------------------------------
+
+Q128 = 1 << 128
+
+
+def sqrt_price_x96_from_price(price: float) -> int:
+    """Compute sqrt_price_x96 for a USDC/HYPE price. (token0=HYPE, token1=USDC)"""
+    raw_price = price * (10 ** (BOT_USDC_DECIMALS - BOT_HYPE_DECIMALS))
+    return int(math.sqrt(raw_price) * Q96)
+
+
+def price_to_tick(price: float) -> int:
+    """Convert USDC/HYPE price to un-snapped Uniswap tick."""
+    p = price * (10 ** (BOT_USDC_DECIMALS - BOT_HYPE_DECIMALS))
+    return int(math.log(p) / math.log(1.0001))
+
+
+def position_amounts(
+    liquidity: int, tick_lower: int, tick_upper: int, sqrt_p: int,
+) -> tuple[int, int]:
+    """Return (raw_amount0, raw_amount1) in position at a given sqrt price."""
+    sp = sqrt_p / Q96
+    spl = math.sqrt(1.0001 ** tick_lower)
+    spu = math.sqrt(1.0001 ** tick_upper)
+    if sp <= spl:
+        return int(liquidity * (spu - spl) / (spl * spu)), 0
+    elif sp >= spu:
+        return 0, int(liquidity * (spu - spl))
+    a0 = int(liquidity * (spu - sp) / (sp * spu))
+    a1 = int(liquidity * (sp - spl))
+    return a0, a1
+
+
+def liquidity_from_amounts(
+    amount0_raw: int, amount1_raw: int,
+    sqrt_p: int, tick_lower: int, tick_upper: int,
+) -> int:
+    """Max deployable liquidity from raw token amounts."""
+    sp = sqrt_p / Q96
+    spl = math.sqrt(1.0001 ** tick_lower)
+    spu = math.sqrt(1.0001 ** tick_upper)
+    if sp <= spl:
+        return int(amount0_raw * spl * spu / (spu - spl))
+    elif sp >= spu:
+        return int(amount1_raw / (spu - spl))
+    l0 = int(amount0_raw * sp * spu / (spu - sp))
+    l1 = int(amount1_raw / (sp - spl))
+    return min(l0, l1)
+
+
+def simulate_swap(amount_human: float, token_in_is_hype: bool, price: float) -> float:
+    """0.3% fee swap. Returns amount_out in human units."""
+    after_fee = amount_human * (1.0 - BOT_SWAP_FEE)
+    return after_fee * price if token_in_is_hype else after_fee / price
+
+
+# -- Data fetching ----------------------------------------------------------
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 HYPE_COIN_ID = "hyperliquid"
+CHUNK_DAYS = 90  # max range for hourly data from CoinGecko
 
 
 def fetch_coin_gecko(days: int = 300) -> list[tuple[int, float]]:
-    """Fetch price data from CoinGecko market_chart. Returns [(unix_ts, price), ...].
+    """Fetch hourly price data by splitting into 90-day chunks.
 
-    Uses market_chart endpoint which returns one point per ~5 min for 1 day
-    or daily for longer ranges. All points are used to reconstruct close prices.
+    Returns [(unix_ts, price), ...] with hourly granularity over the full range.
     """
     import requests
-    url = f"{COINGECKO_BASE}/coins/{HYPE_COIN_ID}/market_chart"
-    params = {"vs_currency": "usd", "days": str(days)}
-    logger.info(f"Fetching {days}d market data from CoinGecko …")
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    raw = data.get("prices", [])
-    if not raw:
-        raise ValueError("No price data in CoinGecko response")
-    # raw entries: [timestamp_ms, price]
-    return [(int(e[0]) // 1000, e[1]) for e in raw]
+
+    now = int(time.time())
+    chunk_sec = CHUNK_DAYS * 86400
+    all_prices: list[tuple[int, float]] = []
+    end_ts = now
+    remaining_days = days
+
+    while remaining_days > 0:
+        chunk = min(remaining_days, CHUNK_DAYS)
+        start_ts = end_ts - chunk * 86400
+
+        url = f"{COINGECKO_BASE}/coins/{HYPE_COIN_ID}/market_chart/range"
+        params = {"vs_currency": "usd", "from": start_ts, "to": end_ts}
+        logger.info(f"Fetching chunk {datetime.fromtimestamp(start_ts).date()} -> "
+                     f"{datetime.fromtimestamp(end_ts).date()}")
+
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data.get("prices", [])
+        all_prices.extend([(int(e[0]) // 1000, e[1]) for e in raw])
+
+        remaining_days -= chunk
+        end_ts = start_ts
+        if remaining_days > 0:
+            time.sleep(2)
+
+    all_prices.sort(key=lambda x: x[0])
+    seen: set[int] = set()
+    deduped: list[tuple[int, float]] = []
+    for ts, p in all_prices:
+        if ts not in seen:
+            seen.add(ts)
+            deduped.append((ts, p))
+    return deduped
 
 
 def load_csv(path: str) -> list[tuple[int, float]]:
-    """Load CSV with columns: timestamp, price (or timestamp,open,high,low,close)."""
+    """Load CSV with columns: timestamp,price (or timestamp,open,high,low,close)."""
     rows: list[tuple[int, float]] = []
     with open(path, newline="") as f:
         reader = csv.reader(f)
@@ -93,72 +171,14 @@ def load_csv(path: str) -> list[tuple[int, float]]:
     return rows
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-def sqrt_price_x96_from_price(price: float, invert: bool) -> int:
-    """Compute sqrt_price_x96 for a human-readable USDC/HYPE price."""
-    p = 1.0 / price if invert else price
-    raw_price = p * (10 ** (BOT_USDC_DECIMALS - BOT_HYPE_DECIMALS))
-    return int(math.sqrt(raw_price) * Q96)
-
-
-def position_amounts(
-    liquidity: int, tick_lower: int, tick_upper: int, sqrt_p: int,
-) -> tuple[int, int]:
-    """Return (raw_amount0, raw_amount1) locked in position at a given sqrt price."""
-    sp = sqrt_p / Q96
-    spl = math.sqrt(1.0001 ** tick_lower)
-    spu = math.sqrt(1.0001 ** tick_upper)
-    if sp <= spl:
-        return int(liquidity * (spu - spl) / (spl * spu)), 0
-    elif sp >= spu:
-        return 0, int(liquidity * (spu - spl))
-    else:
-        a0 = int(liquidity * (spu - sp) / (sp * spu))
-        a1 = int(liquidity * (sp - spl))
-        return a0, a1
-
-
-def liquidity_from_amounts(
-    amount0_raw: int, amount1_raw: int,
-    sqrt_p: int, tick_lower: int, tick_upper: int,
-) -> int:
-    """Compute max deployable liquidity given raw token amounts."""
-    sp = sqrt_p / Q96
-    spl = math.sqrt(1.0001 ** tick_lower)
-    spu = math.sqrt(1.0001 ** tick_upper)
-    if sp <= spl:
-        return int(amount0_raw * spl * spu / (spu - spl))
-    elif sp >= spu:
-        return int(amount1_raw / (spu - spl))
-    else:
-        l0 = int(amount0_raw * sp * spu / (spu - sp))
-        l1 = int(amount1_raw / (sp - spl))
-        return min(l0, l1)
-
-
-def simulate_swap(amount_human: float, token_in_is_hype: bool, price: float) -> float:
-    """Simulate a 0.3%-fee swap. Returns amount_out in human units."""
-    after_fee = amount_human * (1.0 - BOT_SWAP_FEE)
-    return after_fee * price if token_in_is_hype else after_fee / price
-
-
-def price_to_tick_raw(price: float, invert: bool) -> int:
-    """Convert human USDC/HYPE price to Uniswap tick (not snapped to spacing)."""
-    p = 1.0 / price if invert else price
-    raw = p * (10 ** (BOT_USDC_DECIMALS - BOT_HYPE_DECIMALS))
-    return int(math.log(raw) / math.log(1.0001))
-
-
-# ── State ──────────────────────────────────────────────────────────────
+# -- Position state ---------------------------------------------------------
 
 class Position:
     __slots__ = ("liquidity", "tick_lower", "tick_upper",
                   "fee_growth_0_last", "fee_growth_1_last",
-                  "tokens_owed_0", "tokens_owed_1",
-                  "creation_tick", "creation_price")
+                  "tokens_owed_0", "tokens_owed_1")
 
-    def __init__(self, liquidity: int, tl: int, tu: int, tick: int, price: float):
+    def __init__(self, liquidity: int, tl: int, tu: int):
         self.liquidity = liquidity
         self.tick_lower = tl
         self.tick_upper = tu
@@ -166,140 +186,131 @@ class Position:
         self.fee_growth_1_last = 0
         self.tokens_owed_0 = 0
         self.tokens_owed_1 = 0
-        self.creation_tick = tick
-        self.creation_price = price
 
+
+# -- Backtest engine --------------------------------------------------------
 
 class Backtest:
     def __init__(self, initial_hype: float, initial_usdc: float,
-                 hourly_fee_rate: float, dry_run: bool = False):
-        self.hype = initial_hype        # human units (mutable during sim)
+                 hourly_fee_rate: float):
+        self.hype = initial_hype
         self.usdc = initial_usdc
         self.initial_hype = initial_hype
         self.initial_usdc = initial_usdc
         self.hourly_fee_rate = hourly_fee_rate
-        self.dry_run = dry_run
 
         self.pos: Optional[Position] = None
-        self.token0_is_hype = True     # confirmed from pool config
-        self.invert = not self.token0_is_hype  # False
+        self.token0_is_hype = True
+        self.invert = not self.token0_is_hype
 
-        # simulated pool fee growth (per second, scaled by liquidity share)
+        # Fee tracking
         self._fee_growth_global_0 = 0
         self._fee_growth_global_1 = 0
-        self._last_fee_ts: Optional[int] = None
+        self.fees_collected_usd = 0.0
 
-        # counters
+        # Stats
         self.rebalances = 0
         self.adds = 0
         self.swaps = 0
         self.secondary_triggers = 0
-        self.fees_collected_usd = 0.0
         self.history: list[tuple[int, float, float, float, float, float]] = []
 
-    # ── fee simulation ─────────────────────────────────────────────────
-    def _accrue_fees(self, ts: int, price: float):
-        """Accrue fees at hourly_fee_rate of position value per hour when in range."""
-        if self._last_fee_ts is None:
-            self._last_fee_ts = ts
-            return
+    # -- helpers -----------------------------------------------------------
+
+    def _wallet_val(self, price: float) -> float:
+        return self.hype * price + self.usdc
+
+    def _pos_val(self, price: float, sqrt_p: int) -> float:
+        if self.pos is None:
+            return 0.0
+        return position_value_usd(
+            self.pos.liquidity, self.pos.tick_lower, self.pos.tick_upper,
+            sqrt_p, self.token0_is_hype, price,
+            BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS,
+        )
+
+    def _total_val(self, price: float, sqrt_p: int) -> float:
+        return self._wallet_val(price) + self._pos_val(price, sqrt_p)
+
+    # -- fee accrual with compounding --------------------------------------
+
+    def _compound_fees(self, price: float):
+        """Accrue fees for the current step and compound into the position."""
         if self.pos is None or self.pos.liquidity == 0:
-            self._last_fee_ts = ts
             return
 
-        dt = ts - self._last_fee_ts
-        if dt <= 0:
-            return
-
-        tick = price_to_tick_raw(price, self.invert)
+        tick = price_to_tick(price)
         in_range = self.pos.tick_lower <= tick < self.pos.tick_upper
-        self._last_fee_ts = ts
-
         if not in_range:
             return
 
-        sp = sqrt_price_x96_from_price(price, self.invert)
-        pos_val = position_value_usd(
-            self.pos.liquidity, self.pos.tick_lower, self.pos.tick_upper,
-            sp, self.token0_is_hype, price, BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS,
-        )
-        fee_usd = pos_val * self.hourly_fee_rate * dt / 3600
+        sqrt_p = sqrt_price_x96_from_price(price)
+        pos_val = self._pos_val(price, sqrt_p)
+        fee_usd = pos_val * self.hourly_fee_rate
         if fee_usd <= 0:
             return
 
         dec0, dec1 = BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS
         spl = math.sqrt(1.0001 ** self.pos.tick_lower)
         spu = math.sqrt(1.0001 ** self.pos.tick_upper)
+        sp = sqrt_p / Q96
 
         val_per_liq_0 = (spu - sp) / (sp * spu) * price / (10 ** dec0)
         val_per_liq_1 = (sp - spl) / (10 ** dec1)
-        total_val_per_liq = val_per_liq_0 + val_per_liq_1
-
-        if total_val_per_liq <= 0:
+        total_vpl = val_per_liq_0 + val_per_liq_1
+        if total_vpl <= 0:
             return
 
-        fee_liq_0 = fee_usd * val_per_liq_0 / total_val_per_liq
-        fee_liq_1 = fee_usd * val_per_liq_1 / total_val_per_liq
+        # Split fee USD into token amounts
+        fee_tok0_usd = fee_usd * val_per_liq_0 / total_vpl
+        fee_tok1_usd = fee_usd * val_per_liq_1 / total_vpl
+        fee0_raw = int(fee_tok0_usd / price * (10 ** dec0)) if fee_tok0_usd > 0 else 0
+        fee1_raw = int(fee_tok1_usd * (10 ** dec1)) if fee_tok1_usd > 0 else 0
 
-        am0_per_liq = fee_liq_0 / price * (10 ** dec0) if fee_liq_0 > 0 else 0
-        am1_per_liq = fee_liq_1 * (10 ** dec1) if fee_liq_1 > 0 else 0
+        if fee0_raw <= 0 and fee1_raw <= 0:
+            return
 
-        dg0 = int(am0_per_liq * (1 << 128) / max(self.pos.liquidity, 1)) if am0_per_liq > 0 else 0
-        dg1 = int(am1_per_liq * (1 << 128) / max(self.pos.liquidity, 1)) if am1_per_liq > 0 else 0
+        # Calculate how much new liquidity the fee tokens provide
+        add_liq = liquidity_from_amounts(
+            fee0_raw, fee1_raw, sqrt_p,
+            self.pos.tick_lower, self.pos.tick_upper,
+        )
+        if add_liq <= 0:
+            return
 
+        # Compound: add liquidity to the position (fees are now part of the position)
+        self.pos.liquidity += add_liq
+        self.fees_collected_usd += fee_usd
+
+        # Sync the fee-growth trackers so these fees are NOT collected again on removal
+        Q128 = 1 << 128
+        dg0 = int(fee0_raw * Q128 / (self.pos.liquidity - add_liq)) if (fee0_raw > 0 and self.pos.liquidity > add_liq) else 0
+        dg1 = int(fee1_raw * Q128 / (self.pos.liquidity - add_liq)) if (fee1_raw > 0 and self.pos.liquidity > add_liq) else 0
         self._fee_growth_global_0 += dg0
         self._fee_growth_global_1 += dg1
-
-    def _collect_fees(self, price: float) -> tuple[int, int]:
-        """Collect accrued fees into wallet. Returns (hype_gained, usdc_gained) human."""
-        if self.pos is None:
-            return 0.0, 0.0
-
-        Q128 = 1 << 128
-        d0 = (self._fee_growth_global_0 - self.pos.fee_growth_0_last)
-        d1 = (self._fee_growth_global_1 - self.pos.fee_growth_1_last)
-        fee0_raw = self.pos.tokens_owed_0 + (self.pos.liquidity * d0) // Q128
-        fee1_raw = self.pos.tokens_owed_1 + (self.pos.liquidity * d1) // Q128
-
         self.pos.fee_growth_0_last = self._fee_growth_global_0
         self.pos.fee_growth_1_last = self._fee_growth_global_1
-        self.pos.tokens_owed_0 = 0
-        self.pos.tokens_owed_1 = 0
 
-        if self.token0_is_hype:
-            hype_gain = fee0_raw / (10 ** BOT_HYPE_DECIMALS)
-            usdc_gain = fee1_raw / (10 ** BOT_USDC_DECIMALS)
+    # -- core actions ------------------------------------------------------
+
+    def _optimize_ratio(self, price: float, tick_lower: Optional[int] = None, tick_upper: Optional[int] = None):
+        """Mirror bot's _optimize_ratio.
+
+        Uses self.pos ticks if available, otherwise explicit tick_lower/tick_upper.
+        """
+        if self.pos is not None:
+            tl = self.pos.tick_lower
+            tu = self.pos.tick_upper
+        elif tick_lower is not None and tick_upper is not None:
+            tl, tu = tick_lower, tick_upper
         else:
-            hype_gain = fee1_raw / (10 ** BOT_HYPE_DECIMALS)
-            usdc_gain = fee0_raw / (10 ** BOT_USDC_DECIMALS)
+            return
 
-        val = hype_gain * price + usdc_gain
-        self.fees_collected_usd += val
-        if val > 0.001:
-            logger.info(f"  Collected fees: {hype_gain:.6f} HYPE + {usdc_gain:.6f} USDC = ${val:.4f}")
-
-        return hype_gain, usdc_gain
-
-    def _snap_tick(self, tick: int) -> int:
-        return round(tick / BOT_TICK_SPACING) * BOT_TICK_SPACING
-
-    # ── core actions ───────────────────────────────────────────────────
-
-    def _optimize_ratio(self, price: float) -> tuple[float, float]:
-        """Mirror bot's _optimize_ratio. Swap excess token to balance position ratio.
-        Returns (hype, usdc) after optimization."""
-        if self.pos is None:
-            return self.hype, self.usdc
-
-        tick_lower = self.pos.tick_lower
-        tick_upper = self.pos.tick_upper
-        sqrt_p = sqrt_price_x96_from_price(price, self.invert)
-
+        sqrt_p = sqrt_price_x96_from_price(price)
         sp = sqrt_p / Q96
         p = sp * sp
-        spl = math.sqrt(1.0001 ** tick_lower)
-        spu = math.sqrt(1.0001 ** tick_upper)
-
+        spl = math.sqrt(1.0001 ** tl)
+        spu = math.sqrt(1.0001 ** tu)
         target_ratio = sp * spu * (sp - spl) / (spu - sp)
 
         if self.token0_is_hype:
@@ -309,67 +320,70 @@ class Backtest:
             raw0 = int(self.usdc * (10 ** BOT_USDC_DECIMALS))
             raw1 = int(self.hype * (10 ** BOT_HYPE_DECIMALS))
 
-        if raw0 <= 0 or raw1 <= 0:
-            return self.hype, self.usdc
+        if raw0 <= 0 or raw1 <= 0 or target_ratio <= 0:
+            return
 
         current_ratio = raw1 / raw0
-        if current_ratio <= 0 or target_ratio <= 0:
-            return self.hype, self.usdc
-
         deviation = abs(math.log(current_ratio / target_ratio))
         if deviation < 0.01:
-            return self.hype, self.usdc
+            return
 
         if current_ratio > target_ratio:
-            numerator = raw1 - int(target_ratio * raw0)
+            num = raw1 - int(target_ratio * raw0)
             denom = 1.0 + target_ratio / p
-            swap_raw = max(0, int(numerator / denom * 0.99))
+            swap_raw = max(0, int(num / denom * 0.99))
             if swap_raw >= 1000:
                 dec_swap = BOT_USDC_DECIMALS if not self.token0_is_hype else BOT_HYPE_DECIMALS
-                amt_human = swap_raw / (10 ** dec_swap)
+                amt = swap_raw / (10 ** dec_swap)
                 if self.token0_is_hype:
-                    out = simulate_swap(amt_human, False, price)
-                    self.usdc -= amt_human
+                    if amt > self.usdc:
+                        amt = self.usdc * 0.99
+                    out = simulate_swap(amt, False, price)
+                    self.usdc -= amt
                     self.hype += out
                 else:
-                    out = simulate_swap(amt_human, True, price)
-                    self.hype -= amt_human
+                    if amt > self.hype:
+                        amt = self.hype * 0.99
+                    out = simulate_swap(amt, True, price)
+                    self.hype -= amt
                     self.usdc += out
-                self.swaps += 1
+                if amt >= 0.001:
+                    self.swaps += 1
         else:
-            numerator = int(target_ratio * raw0) - raw1
+            num = int(target_ratio * raw0) - raw1
             denom = p + target_ratio
-            swap_raw = max(0, int(numerator / denom * 0.99))
+            swap_raw = max(0, int(num / denom * 0.99))
             if swap_raw >= 1000:
                 dec_swap = BOT_HYPE_DECIMALS if self.token0_is_hype else BOT_USDC_DECIMALS
-                amt_human = swap_raw / (10 ** dec_swap)
+                amt = swap_raw / (10 ** dec_swap)
                 if self.token0_is_hype:
-                    out = simulate_swap(amt_human, True, price)
-                    self.hype -= amt_human
+                    if amt > self.hype:
+                        amt = self.hype * 0.99
+                    out = simulate_swap(amt, True, price)
+                    self.hype -= amt
                     self.usdc += out
                 else:
-                    out = simulate_swap(amt_human, False, price)
-                    self.usdc -= amt_human
+                    if amt > self.usdc:
+                        amt = self.usdc * 0.99
+                    out = simulate_swap(amt, False, price)
+                    self.usdc -= amt
                     self.hype += out
-                self.swaps += 1
+                if amt >= 0.001:
+                    self.swaps += 1
 
-        return self.hype, self.usdc
-
-    def _create_position(self, price: float, ts: int = 0):
+    def _create_position(self, price: float):
         """Mirror bot's create_position."""
         if self.hype <= 0 and self.usdc <= 0:
             return
 
-        tick = price_to_tick_raw(price, self.invert)
         snapped_lower, snapped_upper, _, _ = calculate_bounds(
             price, BOT_LOWER_BOUND_PCT, BOT_UPPER_BOUND_PCT,
             BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS, BOT_TICK_SPACING, self.invert,
         )
 
-        self._optimize_ratio(price)
+        self._optimize_ratio(price, snapped_lower, snapped_upper)
 
-        sqrt_p = sqrt_price_x96_from_price(price, self.invert)
-
+        sqrt_p = sqrt_price_x96_from_price(price)
         if self.token0_is_hype:
             raw0 = int(self.hype * (10 ** BOT_HYPE_DECIMALS))
             raw1 = int(self.usdc * (10 ** BOT_USDC_DECIMALS))
@@ -382,7 +396,6 @@ class Backtest:
             return
 
         a0, a1 = position_amounts(liq, snapped_lower, snapped_upper, sqrt_p)
-
         if self.token0_is_hype:
             self.hype -= a0 / (10 ** BOT_HYPE_DECIMALS)
             self.usdc -= a1 / (10 ** BOT_USDC_DECIMALS)
@@ -390,29 +403,21 @@ class Backtest:
             self.usdc -= a0 / (10 ** BOT_USDC_DECIMALS)
             self.hype -= a1 / (10 ** BOT_HYPE_DECIMALS)
 
-        self.pos = Position(liq, snapped_lower, snapped_upper, tick, price)
-        if ts > 0:
-            self._last_fee_ts = ts
-        logger.info(
-            f"  Created position: liq={liq} range=[{snapped_lower},{snapped_upper}] "
-            f"a0={a0} a1={a1}"
-        )
+        self.pos = Position(liq, snapped_lower, snapped_upper)
 
     def _remove_position(self, price: float):
-        """Remove all liquidity and return tokens to wallet."""
+        """Remove all liquidity and return tokens + fees to wallet."""
         if self.pos is None:
             return
 
-        sqrt_p = sqrt_price_x96_from_price(price, self.invert)
-        tick = price_to_tick_raw(price, self.invert)
+        sqrt_p = sqrt_price_x96_from_price(price)
         a0, a1 = position_amounts(
             self.pos.liquidity, self.pos.tick_lower, self.pos.tick_upper, sqrt_p,
         )
 
-        # Include owed fees
-        Q128 = 1 << 128
-        d0 = (self._fee_growth_global_0 - self.pos.fee_growth_0_last)
-        d1 = (self._fee_growth_global_1 - self.pos.fee_growth_1_last)
+        # Collect outstanding fees
+        d0 = self._fee_growth_global_0 - self.pos.fee_growth_0_last
+        d1 = self._fee_growth_global_1 - self.pos.fee_growth_1_last
         fee0 = self.pos.tokens_owed_0 + (self.pos.liquidity * d0) // Q128
         fee1 = self.pos.tokens_owed_1 + (self.pos.liquidity * d1) // Q128
         a0 += fee0
@@ -438,15 +443,12 @@ class Backtest:
         """Mirror bot's add_to_position."""
         if self.pos is None:
             return
-
-        wallet_val = self.hype * price + self.usdc
-        if wallet_val < BOT_WALLET_MIN:
+        if self._wallet_val(price) < BOT_WALLET_MIN:
             return
 
         self._optimize_ratio(price)
 
-        sqrt_p = sqrt_price_x96_from_price(price, self.invert)
-
+        sqrt_p = sqrt_price_x96_from_price(price)
         if self.token0_is_hype:
             raw0 = int(self.hype * (10 ** BOT_HYPE_DECIMALS))
             raw1 = int(self.usdc * (10 ** BOT_USDC_DECIMALS))
@@ -460,10 +462,7 @@ class Backtest:
         if add_liq <= 0:
             return
 
-        a0, a1 = position_amounts(
-            add_liq, self.pos.tick_lower, self.pos.tick_upper, sqrt_p,
-        )
-
+        a0, a1 = position_amounts(add_liq, self.pos.tick_lower, self.pos.tick_upper, sqrt_p)
         if self.token0_is_hype:
             self.hype -= a0 / (10 ** BOT_HYPE_DECIMALS)
             self.usdc -= a1 / (10 ** BOT_USDC_DECIMALS)
@@ -474,31 +473,37 @@ class Backtest:
         self.pos.liquidity += add_liq
         self.adds += 1
 
-    # ── main simulation ────────────────────────────────────────────────
+    # -- main simulation ---------------------------------------------------
 
     def run(self, prices: list[tuple[int, float]]) -> dict[str, Any]:
-        initial_price = prices[0][1]
-        initial_total = self.hype * initial_price + self.usdc
+        if not prices:
+            raise ValueError("No price data")
 
+        initial_price = prices[0][1]
+        initial_total = self._wallet_val(initial_price)
         last_cycle_ts: Optional[int] = None
         last_secondary_ts: Optional[int] = None
 
+        total_steps = len(prices)
+        log_every = max(1, total_steps // 100)  # log ~100 lines
+
         for idx, (ts, price) in enumerate(prices):
             if idx == 0:
-                self._last_fee_ts = ts
+                sqrt_p = sqrt_price_x96_from_price(price)
                 self.history.append((ts, price, self.hype, self.usdc,
                                      self.pos.liquidity if self.pos else 0,
-                                     self.hype * price + self.usdc))
+                                     self._total_val(price, sqrt_p)))
                 continue
 
-            self._accrue_fees(ts, price)
-            tick = price_to_tick_raw(price, self.invert)
+            # 1. Fee compounding (happens every step when in range)
+            self._compound_fees(price)
 
-            # ── secondary cycle (anti-IL) ─────────────────────────────
+            tick = price_to_tick(price)
+
+            # 2. Secondary cycle (anti-IL)
             if (last_secondary_ts is None
                 or (ts - last_secondary_ts) >= BOT_SECONDARY_INTERVAL):
                 last_secondary_ts = ts
-
                 if self.pos is not None:
                     lower_p = tick_to_price(
                         self.pos.tick_lower, BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS, self.invert,
@@ -518,7 +523,7 @@ class Backtest:
                             self.swaps += 1
                         self.secondary_triggers += 1
 
-            # ── main cycle ────────────────────────────────────────────
+            # 3. Main cycle
             if (last_cycle_ts is None
                 or (ts - last_cycle_ts) >= BOT_SLEEP_INTERVAL):
                 last_cycle_ts = ts
@@ -527,62 +532,50 @@ class Backtest:
                     in_range = self.pos.tick_lower <= tick < self.pos.tick_upper
 
                     if not in_range:
-                        logger.info(
-                            f"[{datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')}] "
-                            f"Out of range (tick={tick}), rebalancing"
-                        )
+                        if idx % log_every == 0:
+                            logger.info(
+                                f"[{datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')}] "
+                                f"Out of range (tick={tick}), rebalancing"
+                            )
                         self._remove_position(price)
                         self.rebalances += 1
-                        self._create_position(price, ts)
+                        self._create_position(price)
                     else:
-                        if self.hype * price + self.usdc > BOT_WALLET_MIN:
-                            self._add_to_position(price)
+                        self._add_to_position(price)
 
-                        pos_val = position_value_usd(
-                            self.pos.liquidity, self.pos.tick_lower, self.pos.tick_upper,
-                            sqrt_price_x96_from_price(price, self.invert),
-                            self.token0_is_hype, price,
-                            BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS,
-                        )
+                        sqrt_p = sqrt_price_x96_from_price(price)
+                        pos_val = self._pos_val(price, sqrt_p)
                         if pos_val <= 1.0:
-                            logger.info(f"  Position value ${pos_val:.2f} <= $1, recreating")
                             self._remove_position(price)
-                            self._create_position(price, ts)
+                            self._create_position(price)
                 else:
-                    self._create_position(price, ts)
+                    self._create_position(price)
 
-            # record every 6 hours
-            if idx % 6 == 0:
-                pos_liq = self.pos.liquidity if self.pos else 0
-                total = self.hype * price + self.usdc
-                if self.pos:
-                    pv = position_value_usd(
-                        self.pos.liquidity, self.pos.tick_lower, self.pos.tick_upper,
-                        sqrt_price_x96_from_price(price, self.invert),
-                        self.token0_is_hype, price,
-                        BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS,
-                    )
-                    total += pv
-                self.history.append((ts, price, self.hype, self.usdc, pos_liq, total))
+            # Record every step for full granularity
+            sqrt_p = sqrt_price_x96_from_price(price)
+            self.history.append((ts, price, self.hype, self.usdc,
+                                 self.pos.liquidity if self.pos else 0,
+                                 self._total_val(price, sqrt_p)))
 
+        # Final valuation: close any open position
         final_price = prices[-1][1]
         if self.pos:
             self._remove_position(final_price)
+        final_total = self._wallet_val(final_price)
 
-        final_total = self.hype * final_price + self.usdc
         hodl_hype = initial_total / initial_price
         hodl_val = hodl_hype * final_price
 
         return {
             "initial_hype": self.initial_hype,
             "initial_usdc": self.initial_usdc,
+            "initial_total": initial_total,
             "initial_price": initial_price,
             "final_price": final_price,
             "final_hype": self.hype,
             "final_usdc": self.usdc,
             "final_total": final_total,
             "hodl_total": hodl_val,
-            "initial_total": initial_total,
             "return_pct": (final_total / initial_total - 1) * 100,
             "hodl_return_pct": (hodl_val / initial_total - 1) * 100,
             "outperformance_pct": (final_total / hodl_val - 1) * 100,
@@ -591,27 +584,25 @@ class Backtest:
             "adds": self.adds,
             "swaps": self.swaps,
             "secondary_triggers": self.secondary_triggers,
+            "steps": len(self.history),
             "history": self.history,
         }
 
 
-# ── CLI ─────────────────────────────────────────────────────────────────
+# -- CLI --------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="HYPE/USDC Liquidity Bot Backtest")
-    parser.add_argument("--initial-hype", type=float, default=10.0,
-                        help="Initial wHYPE balance")
-    parser.add_argument("--initial-usdc", type=float, default=200.0,
-                        help="Initial USDC balance")
+    parser.add_argument("--initial-hype", type=float, default=10.0)
+    parser.add_argument("--initial-usdc", type=float, default=200.0)
     parser.add_argument("--hourly-fee-rate", type=float, default=0.01,
-                        help="Hourly fee rate as fraction of position value (0.01 = 1%%/hr)")
+                        help="Hourly fee as fraction of position value (0.01 = 1%%/hr)")
     parser.add_argument("--csv", type=str, default=None,
-                        help="CSV file with price data (columns: timestamp,close "
-                             "or timestamp,open,high,low,close)")
+                        help="CSV file with price data (timestamp,close or OHLC)")
     parser.add_argument("--days", type=int, default=300,
-                        help="Days of CoinGecko data to fetch")
+                        help="Days of CoinGecko data (fetched in hourly chunks)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Save CSV history to file")
+                        help="Save full step-by-step history to CSV")
     args = parser.parse_args()
 
     if args.csv:
@@ -630,18 +621,18 @@ def main():
     bt = Backtest(args.initial_hype, args.initial_usdc, args.hourly_fee_rate)
     result = bt.run(prices)
 
-    # ── print report ───────────────────────────────────────────────────
-    print()
     sep = "=" * 60
+    print()
     print(sep)
     print("  BACKTEST RESULTS")
     print(sep)
+    print(f"  Data points:      {result['steps']}")
     print(f"  Initial capital:  {result['initial_hype']:.4f} HYPE + "
           f"{result['initial_usdc']:.2f} USDC = ${result['initial_total']:.2f}")
     print(f"  Initial price:    ${result['initial_price']:.4f}")
     print(f"  Final price:      ${result['final_price']:.4f}")
     print(f"  Price change:     {result['final_price']/result['initial_price']*100-100:+.2f}%")
-    print(f"  Hourly fee rate:  {args.hourly_fee_rate*100:.2f}%/hr")
+    print(f"  Hourly fee rate:  {args.hourly_fee_rate*100:.2f}%/hr (compounds every step)")
     print()
     print(f"  -- Portfolio --")
     print(f"  Final HYPE:       {result['final_hype']:.4f}")
@@ -662,7 +653,6 @@ def main():
     print(f"  Fees earned:      ${result['fees_earned']:.2f}")
     print(sep)
 
-    # ── save CSV ────────────────────────────────────────────────────────
     if args.output:
         with open(args.output, "w", newline="") as f:
             w = csv.writer(f)
@@ -670,7 +660,7 @@ def main():
                          "position_liquidity", "total_value_usd"])
             for row in result["history"]:
                 w.writerow(row)
-        logger.info(f"History saved to {args.output}")
+        logger.info(f"Full {result['steps']}-row history saved to {args.output}")
 
 
 if __name__ == "__main__":
