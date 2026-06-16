@@ -25,6 +25,9 @@ class Config:
     FEE_TIER: int = int(os.getenv("FEE_TIER", "3000"))
     FEE_COMPOUND_THRESHOLD_USD: float = float(os.getenv("FEE_COMPOUND_THRESHOLD_USD", "5.0"))
 
+    SECONDARY_CYCLE_INTERVAL: int = int(os.getenv("SECONDARY_CYCLE_INTERVAL", "600"))
+    HYPE_DROP_THRESHOLD: float = float(os.getenv("HYPE_DROP_THRESHOLD", "0.98"))
+
     HYPE_DECIMALS: int = int(os.getenv("HYPE_DECIMALS", "18"))
     USDC_DECIMALS: int = int(os.getenv("USDC_DECIMALS", "6"))
 
