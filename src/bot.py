@@ -37,6 +37,7 @@ logger = logging.getLogger("liqbot")
 running = True
 tx_lock = threading.Lock()
 token_id_ref = [0]
+upper_threshold_event = threading.Event()
 
 
 def signal_handler(sig, frame):
@@ -90,11 +91,14 @@ def _secondary_cycle():
                 token0_is_hype, dec0, dec1 = get_token_order(pool, config.HYPE_ADDRESS)
                 invert = not token0_is_hype
                 lower_price = tick_to_price(pos["tickLower"], dec0, dec1, invert)
+                upper_price = tick_to_price(pos["tickUpper"], dec0, dec1, invert)
                 trigger_price = lower_price * config.HYPE_DROP_THRESHOLD
+                upper_trigger_price = upper_price * config.HYPE_UPPER_THRESHOLD
 
                 logger.info(
                     f"[SECONDARY] Price=${current_price:.4f} "
-                    f"lower=${lower_price:.4f} trigger=${trigger_price:.4f}"
+                    f"lower=${lower_price:.4f} upper=${upper_price:.4f} "
+                    f"drop_trigger=${trigger_price:.4f} surge_trigger=${upper_trigger_price:.4f}"
                 )
 
                 if current_price < trigger_price:
@@ -130,6 +134,12 @@ def _secondary_cycle():
                                     break
                                 sleep(1)
                             continue
+                elif current_price > upper_trigger_price:
+                    logger.warning(
+                        f"[SECONDARY] Price ${current_price:.4f} surged >{((config.HYPE_UPPER_THRESHOLD - 1) * 100):.0f}% "
+                        f"above upper bound ${upper_price:.4f}. Signaling main cycle to skip sleep..."
+                    )
+                    upper_threshold_event.set()
                 else:
                     logger.info("[SECONDARY] Price within threshold, no action")
             else:
@@ -147,7 +157,7 @@ def _secondary_cycle():
 
 
 def run_bot():
-    global running, token_id_ref
+    global running, token_id_ref, upper_threshold_event
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -167,7 +177,8 @@ def run_bot():
     )
     logger.info(
         f"Secondary protection cycle: interval={config.SECONDARY_CYCLE_INTERVAL}s, "
-        f"drop_threshold={config.HYPE_DROP_THRESHOLD}"
+        f"drop_threshold={config.HYPE_DROP_THRESHOLD}, "
+        f"upper_threshold={config.HYPE_UPPER_THRESHOLD}"
     )
 
     token_id_ref[0] = token_id
@@ -323,11 +334,14 @@ def run_bot():
                     pass
             threading.Thread(target=stdin_listener, daemon=True).start()
             for _ in range(int(remaining)):
-                if not running or skip_flag.is_set():
+                if not running or skip_flag.is_set() or upper_threshold_event.is_set():
                     break
                 sleep(1)
             if skip_flag.is_set():
                 logger.info("Skip received, starting next cycle...")
+            if upper_threshold_event.is_set():
+                logger.info("Upper threshold triggered by secondary, starting next cycle...")
+                upper_threshold_event.clear()
 
     logger.info("Bot stopped.")
 
