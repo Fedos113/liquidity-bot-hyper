@@ -11,6 +11,18 @@ from src.math_utils import get_tick_spacing, get_token_order, calculate_bounds, 
 
 logger = logging.getLogger("liqbot")
 
+_hype_price_usd: Optional[float] = None
+MAX_TX_FEE_USD = 0.05
+
+
+class TxFeeExceeded(Exception):
+    pass
+
+
+def set_hype_price(price: float) -> None:
+    global _hype_price_usd
+    _hype_price_usd = price
+
 
 def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxReceipt]:
     if dry_run:
@@ -24,7 +36,19 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
     if receipt["status"] == 1:
-        logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {receipt['gasUsed']})")
+        gas_used = receipt["gasUsed"]
+        gas_price = receipt.get("effectiveGasPrice", tx.get("gasPrice", 0))
+        gas_cost_wei = gas_used * gas_price
+        gas_cost_hype = gas_cost_wei / 1e18
+        logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {gas_used}, fee: {gas_cost_hype:.9f} HYPE)")
+
+        if _hype_price_usd is not None:
+            gas_cost_usd = gas_cost_hype * _hype_price_usd
+            if gas_cost_usd > MAX_TX_FEE_USD:
+                logger.warning(
+                    f"Tx fee ${gas_cost_usd:.4f} exceeds ${MAX_TX_FEE_USD:.2f}, raising TxFeeExceeded"
+                )
+                raise TxFeeExceeded(f"Tx fee ${gas_cost_usd:.4f} > ${MAX_TX_FEE_USD:.2f}")
     else:
         revert_reason = ""
         try:
