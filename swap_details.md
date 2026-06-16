@@ -13,8 +13,8 @@ This document traces every step of the **HYPE/USDC Concentrated Liquidity Bot** 
 5. [Rebalance Flow](#5-rebalance-flow)
 6. [Swap Mechanism](#6-swap-mechanism)
 7. [Fee Collection & Compounding](#7-fee-collection--compounding)
-8. [Balance Tokens (50/50 Split)](#8-balance-tokens-5050-split)
-9. [Pre-Mint Iterative Swap Loop](#9-pre-mint-iterative-swap-loop)
+ 8. [Balance Tokens](#8-balance-tokens)
+ 9. [Optimize Token Ratio (_optimize_ratio)](#9-optimize-token-ratio-_optimize_ratio)
 10. [Post-Mint Top-Up](#10-post-mint-top-up)
 11. [Dashboard & Metrics](#11-dashboard--metrics)
 12. [Real Execution Log Traces](#12-real-execution-log-traces)
@@ -138,16 +138,15 @@ When the saved `TOKEN_ID` points to a position with zero liquidity or an invalid
 
 Called when no position exists or after removing an out-of-range position.
 
-### `create_position()` in `src/position_manager.py:628-749`
+### `create_position()` in `src/position_manager.py:540-619`
 
 ```
 Step 0: Balance Tokens (balance_tokens)
   ├── Check native HYPE balance
-  ├── Wrap native HYPE → wHYPE (keep 0.01 HYPE for gas)
+  ├── Compute wrap_amount = native_balance - 0.01 HYPE (gas reserve)
+  ├── If wrap_amount > 0: wrap native HYPE → wHYPE (call wHYPE.deposit())
   ├── Read wHYPE and USDC balances
-  ├── If only wHYPE: swap half for USDC
-  ├── If only USDC: swap half for wHYPE
-  └── If both present: skip swap
+  └── (No swap here — ratio optimization happens in Step 1b)
 
 Step 1: Calculate Bounds
   ├── lower_price = current_price * LOWER_BOUND_PCT (0.97)
@@ -157,17 +156,16 @@ Step 1: Calculate Bounds
   ├── Ensure tick_lower < tick_upper
   └── Convert back to actual prices for logging
 
-Step 1b: Pre-Mint Iterative Swap Loop (up to 5 iterations)
+Step 1b: Optimize Token Ratio (_optimize_ratio)
   ├── Compute target_ratio = sp * spu * (sp - spl) / (spu - sp)
   │   where sp = sqrt(current_price), spl/spu = sqrt(lower/upper tick prices)
   ├── Compare current token ratio (raw1/raw0) to target
-  ├── If deviation < 1% → break (optimal ratio achieved)
-  ├── If deviation >= 1% and excess > $2:
-  │   ├── swap_frac = min(0.50, 25.0 / excess_usd)
-  │   ├── Swap excess token for the other (exactInputSingle)
-  │   │   └── approve → swap
-  │   └── Re-read balances, repeat
-  └── (This ensures near-full capital utilization at mint)
+  ├── If deviation < 1% → return (optimal ratio achieved)
+  ├── If deviation >= 1%:
+  │   ├── Compute excess_raw of the overrepresented token
+  │   ├── Swap 95% of excess via exactInputSingle (approve → swap)
+  │   └── Re-read balances once after the swap
+  └── (Single swap, not iterative — the 95% fraction avoids overshooting)
 
 Step 2: Calculate Optimal Amounts
   └── calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
@@ -226,7 +224,7 @@ Mint tx sent, confirmed, new Token ID: 495097
 
 Called when the position is out of range (price moved outside bounds).
 
-### `rebalance()` in `src/position_manager.py:423-625`
+### `rebalance()` in `src/position_manager.py:379-537`
 
 ```
 === Starting Rebalance ===
@@ -246,16 +244,14 @@ Step 3: Collect Fees Again (after removal)
   └── Same as Step 1 (catches any residual fees)
 
 Step 4: Balance Tokens
-  ├── Wrap any native HYPE
-  ├── If only wHYPE: swap half for USDC
-  ├── If only USDC: swap half for wHYPE
-  └── (Tries to reach 50/50 value split)
+  ├── Wrap any native HYPE (keep 0.01 HYPE for gas)
+  └── (No swap — ratio optimization handled in Step 5b)
 
 Step 5: Calculate New Bounds
   └── Same as create_position Step 1
 
-Step 5b: Pre-Mint Iterative Swap Loop
-  └── Same as create_position Step 1b (up to 5 iterations)
+Step 5b: Optimize Token Ratio
+  └── Same as create_position Step 1b (_optimize_ratio, single swap of 95%)
 
 Step 6: Calculate Optimal Amounts
   └── Same as create_position Step 2
@@ -297,7 +293,7 @@ Mint tx: tickLower=-234600, tickUpper=-233610
 
 ## 6. Swap Mechanism
 
-### `swap_exact_input_single()` in `src/position_manager.py:766-797`
+### `swap_exact_input_single()` in `src/position_manager.py:636-667`
 
 Swaps an exact amount of one token for another via the Swap Router.
 
@@ -344,31 +340,18 @@ Swaps occur in these contexts:
 
 | Context | Direction | Purpose |
 |---|---|---|
-| **balance_tokens()** | HYPE→USDC or USDC→HYPE | 50/50 value split when only one token type is present |
-| **Pre-mint loop** | Excess token → other token | Match the pool's required ratio before minting |
-| **Post-mint top-up** | Excess leftover → other token | Deploy remaining capital into the position |
+| **_optimize_ratio()** | Excess token → other token | Correct wallet ratio to match pool's optimal ratio before minting |
+| **Post-mint top-up** | Excess leftover → other token | Deploy remaining capital into the position (92% of excess) |
 | **add_to_position()** | Excess token → other token | Correct ratio before adding liquidity to existing position |
 
 ### Real Swap Examples
 
-**Half-balance swap (~$25):**
+**Pre-mint ratio correction (single swap, 95% of excess):**
 ```
-Wrapping 0.7300 HYPE → wHYPE (tx)
-Swapping half wHYPE (~0.3650) for USDC
-  → Approve SwapRouter for 365000000000000000
-  → Swap 0.3650 wHYPE → USDC via fee=500 (tx)
-  → Result: wallet now has both wHYPE and USDC
-```
-
-**Pre-mint ratio correction (2 iterations):**
-```
-Iter 0: token0→token1, ~$24.2 excess
-  → Approve SwapRouter for 0.1397 wHYPE
-  → Swap 0.1397 wHYPE → USDC
-Iter 1: token0→token1, ~$2.8 excess
-  → Approve for 0.0193 wHYPE
-  → Swap 0.0193 wHYPE → USDC
-✓ Deviation < 1%, optimal ratio achieved
+Ratio deviation: token0→token1, ~$24.2 excess
+  → Approve SwapRouter for 0.3111 wHYPE
+  → Swap 0.3111 wHYPE → USDC (95% of excess)
+  → Final amounts: 1.479 wHYPE, 79.75 USDC
 ```
 
 ---
@@ -430,45 +413,34 @@ Fees ($0.00) below $5.0
 
 ---
 
-## 8. Balance Tokens (50/50 Split)
+## 8. Balance Tokens
 
-### `balance_tokens()` in `src/position_manager.py:800-870`
+### `balance_tokens()` in `src/position_manager.py:670-691`
 
 Called at the start of `create_position()` and as Step 4 of `rebalance()`.
 
 ```
-balance_tokens(w3, pool_contract):
+balance_tokens(w3, dry_run):
   1. Read native HYPE balance
   2. Compute wrap_amount = native_balance - 0.01 HYPE (gas reserve)
   3. If wrap_amount > 0: wrap_hype(wrap_amount)
      └─ Calls wHYPE.deposit() with value = wrap_amount (payable function)
   4. Read wHYPE and USDC balances
-  5. Decision:
-     ├── Only wHYPE (> 0) + No USDC (= 0):
-     │   ├── Read current tick from pool
-     │   ├── Convert tick → price
-     │   ├── half = wHYPE_balance / 2
-     │   ├── Approve SwapRouter for half
-     │   └── swap_exact_input_single(HYPE → USDC, half amount)
-     │
-     ├── Only USDC (> 0) + No wHYPE (= 0):
-     │   ├── half = usdc_balance / 2
-     │   ├── Approve SwapRouter for half
-     │   └── swap_exact_input_single(USDC → HYPE, half amount)
-     │
-     └── Both tokens present:
-         └── Skip swap (already balanced enough)
+  5. Log balances
+  └── (No swap — the _optimize_ratio function handles ratio correction)
 ```
 
-### Why 50/50?
+### Why No Swap Here?
 
-The bot targets a simple 50/50 value split because it's a reasonable starting point before the pre-mint iterative swaps fine-tune the ratio. The pre-mint loop (next section) handles the precise ratio needed for full capital utilization at the chosen price range.
+The old 50/50 split was removed because `_optimize_ratio()` (Step 1b/5b) handles the precise ratio needed for full capital utilization. Wrapping native HYPE is the only essential preparatory step; the ratio correction happens right before minting with the actual pool math.
 
 ---
 
-## 9. Pre-Mint Iterative Swap Loop
+## 9. Optimize Token Ratio (_optimize_ratio)
 
 This is a critical optimization used in both `create_position()` and `rebalance()`. It ensures the wallet's token ratio matches what the pool needs for full capital utilization at the chosen tick range.
+
+### `_optimize_ratio()` in `src/position_manager.py:692-751`
 
 ### The Math
 
@@ -488,43 +460,37 @@ deviation = |ln(current_ratio / target_ratio)|
 ### The Algorithm
 
 ```
-for iteration in range(5):
-  compute target_ratio from tick bounds and current price
-  compute current_ratio from wallet balances
-  compute deviation
+Compute target_ratio from tick bounds and current price
+Compute current_ratio from wallet balances
+Compute deviation
 
-  if deviation < 0.01 (1%):  → break (good enough)
+If deviation < 0.01 (1%):  → return (already optimal)
 
-  compute excess_usd value of the overrepresented token
-  if excess_usd < $2:  → break (not worth swapping)
+Determine which token is overrepresented:
+  If current_ratio > target_ratio → excess token1
+  If current_ratio < target_ratio → excess token0
 
-  swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
-  swap_amount = int(excess_raw * swap_frac * 0.95)
+Compute excess_raw of the overrepresented token
+swap_raw = int(excess_raw * 0.95)
 
-  if current_ratio > target_ratio:
-    swap excess token1 → token0
-  else:
-    swap excess token0 → token1
+If swap_raw >= 1000:
+  approve → SwapRouter
+  swap_exact_input_single(excess_token → other_token, swap_raw)
 
-  re-read balances
+Re-read balances once
 ```
 
-### Why Iterative?
+### Single Swap, Not Iterative
 
-Each swap moves the price (slippage), so swapping the full excess at once would overshoot. By swapping at most 50% per iteration and capping the dollar amount at $25 worth, the bot converges gradually.
+The old iterative approach was simplified to a single swap of 95% of the excess raw amount. Swapping 95% instead of 100% accounts for slippage without needing multiple iterations. The `$2` minimum check was also removed — swaps proceed as long as `swap_raw >= 1000` (a dust threshold in raw units).
 
-### Real Example (2 iterations, ~$27 excess)
+### Real Example
 
 ```
-Iter 0: token0→token1, ~$24.2 excess
-  → Approve 0.1397 wHYPE → SwapRouter
-  → Swap 0.1397 wHYPE → USDC (gas: 114079)
-Iter 1: token0→token1, ~$2.8 excess
-  → Approve 0.0193 wHYPE → SwapRouter
-  → Swap 0.0193 wHYPE → USDC (gas: 114079)
-✓ Deviation < 1%, optimal amounts:
-  amount0=1665245028764140032 (1.665 wHYPE)
-  amount1=89973685 (89.97 USDC)
+Ratio deviation: token0->token1
+  → Approve SwapRouter for 0.3111 wHYPE
+  → Swap 0.3111 wHYPE → USDC (95% of excess)
+  → Final amounts: 1.479 wHYPE, 79.75 USDC
 ```
 
 ---
@@ -533,7 +499,7 @@ Iter 1: token0→token1, ~$2.8 excess
 
 After minting a position, there's often a small leftover balance due to rounding. The bot tries to deploy this too.
 
-### In `rebalance()` lines 571-622
+### In `rebalance()` lines 483-534
 
 ```
 1. Read wallet balances after mint
@@ -762,7 +728,7 @@ When wallet has almost no tokens (< $1), the calculated amounts (e.g., `amount0=
 | **NonfungiblePositionManager** | Uniswap V3 contract that manages NFT positions — each position is an ERC-721 token. |
 | **Concentrated Liquidity** | Liquidity provision within a specific price range, earning fees only when the price is in range. |
 | **Auto-discovery** | Scanning the wallet's ERC-721 tokens to find active position NFTs. |
-| **Pre-mint swap** | Swapping tokens before minting to achieve the optimal ratio for full capital utilization. |
+| **Pre-mint swap (_optimize_ratio)** | Single swap of 95% of the excess token before minting, correcting the wallet ratio to match the pool's optimal ratio. |
 | **Post-mint top-up** | Swapping any leftover tokens after minting and adding them via increaseLiquidity. |
 
 ---

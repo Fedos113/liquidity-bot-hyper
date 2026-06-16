@@ -263,9 +263,8 @@ def mint_position(
         f"amount0={amount0_desired}, amount1={amount1_desired}"
     )
 
-    mint_slippage = config.SLIPPAGE_TOLERANCE * 10
-    amount0_min = int(amount0_desired * (1 - mint_slippage))
-    amount1_min = int(amount1_desired * (1 - mint_slippage))
+    amount0_min = 0
+    amount1_min = 0
     tx = position_manager.functions.mint({
         "token0": token0_addr,
         "token1": token1_addr,
@@ -307,9 +306,8 @@ def increase_liquidity(
         return True
 
     deadline = build_deadline(w3)
-    slippage = config.SLIPPAGE_TOLERANCE
-    amount0_min = int(amount0_desired * (1 - slippage))
-    amount1_min = int(amount1_desired * (1 - slippage))
+    amount0_min = 0
+    amount1_min = 0
 
     tx = position_manager.functions.increaseLiquidity({
         "tokenId": token_id,
@@ -360,8 +358,11 @@ def add_to_position(
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
-    from src.math_utils import calculate_token_amounts
-    add0, add1 = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
+    hype_bal, usdc_bal = get_token_balances(w3)
+    if token0_is_hype:
+        add0, add1 = hype_bal, usdc_bal
+    else:
+        add0, add1 = usdc_bal, hype_bal
     add0 = max(1, add0)
     add1 = max(1, add1)
     if add0 == 1 and add1 == 1:
@@ -433,8 +434,6 @@ def rebalance(
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
-    from src.math_utils import calculate_token_amounts
-
     if token0_is_hype:
         raw0, raw1 = hype_bal, usdc_bal
     else:
@@ -449,12 +448,24 @@ def rebalance(
     logger.info("Step 5b: Optimizing token ratio...")
     raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
 
-    am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
-    amount0_desired = max(am0_opt, 1)
-    amount1_desired = max(am1_opt, 1)
-    logger.info(f"Optimal amounts: {amount0_desired} t0, {amount1_desired} t1")
+    logger.info("Step 6: Reading current balances and price for mint...")
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    hype_bal, usdc_bal = get_token_balances(w3)
+    if token0_is_hype:
+        amount0_desired, amount1_desired = hype_bal, usdc_bal
+    else:
+        amount0_desired, amount1_desired = usdc_bal, hype_bal
 
-    logger.info("Step 6: Approving tokens...")
+    tick_lower = round(tick_lower / tick_spacing) * tick_spacing
+    tick_upper = round(tick_upper / tick_spacing) * tick_spacing
+    logger.info(f"Using raw wallet balances for mint: amount0={amount0_desired} t0, amount1={amount1_desired} t1, ticks=[{tick_lower},{tick_upper}]")
+
+    if amount0_desired <= 1 and amount1_desired <= 1:
+        logger.warning("No tokens available after ratio optimization, aborting mint")
+        return token_id
+
+    logger.info("Step 7: Approving tokens...")
     hype_con = get_hype_or_usdc(w3, True)
     usdc_con = get_hype_or_usdc(w3, False)
     pm_addr = config.POSITION_MANAGER_ADDRESS
@@ -466,7 +477,7 @@ def rebalance(
         approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
         approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
 
-    logger.info(f"Step 7: Minting new position (fee tier: {pool_fee})...")
+    logger.info(f"Step 8: Minting new position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
         w3, position_manager, pool_contract,
         tick_lower, tick_upper, amount0_desired, amount1_desired,
@@ -519,8 +530,7 @@ def rebalance(
                     swap_exact_input_single(w3, t_in, t_out, pool_fee, amount_in, dry_run)
 
             hype_bal, usdc_bal = get_token_balances(w3)
-            add0_raw, add1_raw = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
-            add0, add1 = calculate_token_amounts(add0_raw, add1_raw, sqrt_price_x96, tick_lower, tick_upper)
+            add0, add1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
             add0 = max(1, add0)
             add1 = max(1, add1)
             if add0 > 1 or add1 > 1:
@@ -571,7 +581,6 @@ def create_position(
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
-    from src.math_utils import calculate_token_amounts
 
     if token0_is_hype:
         raw0, raw1 = hype_bal, usdc_bal
@@ -587,12 +596,20 @@ def create_position(
     logger.info("Step 1b: Optimizing token ratio...")
     raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
 
-    am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
-    amount0_desired = max(am0_opt, 1)
-    amount1_desired = max(am1_opt, 1)
-    logger.info(f"Optimal amounts: {amount0_desired} t0, {amount1_desired} t1")
+    logger.info("Step 2: Reading current balances and price for mint...")
+    slot0 = pool_contract.functions.slot0().call()
+    sqrt_price_x96 = slot0[0]
+    hype_bal, usdc_bal = get_token_balances(w3)
+    if token0_is_hype:
+        amount0_desired, amount1_desired = hype_bal, usdc_bal
+    else:
+        amount0_desired, amount1_desired = usdc_bal, hype_bal
 
-    logger.info("Step 2: Approving tokens...")
+    tick_lower = round(tick_lower / tick_spacing) * tick_spacing
+    tick_upper = round(tick_upper / tick_spacing) * tick_spacing
+    logger.info(f"Using raw wallet balances for mint: amount0={amount0_desired} t0, amount1={amount1_desired} t1, ticks=[{tick_lower},{tick_upper}]")
+
+    logger.info("Step 3: Approving tokens...")
     hype_con = get_hype_or_usdc(w3, True)
     usdc_con = get_hype_or_usdc(w3, False)
     pm_addr = config.POSITION_MANAGER_ADDRESS
@@ -604,7 +621,7 @@ def create_position(
         approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
         approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
 
-    logger.info(f"Step 3: Minting position (fee tier: {pool_fee})...")
+    logger.info(f"Step 4: Minting position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
         w3, position_manager, pool_contract,
         tick_lower, tick_upper, amount0_desired, amount1_desired,
@@ -703,6 +720,7 @@ def _optimize_ratio(
     import math
     Q96 = 2 ** 96
     sp = sqrt_price_x96 / Q96
+    p = sp * sp
     spl = math.sqrt(1.0001 ** tick_lower)
     spu = math.sqrt(1.0001 ** tick_upper)
     target_ratio = sp * spu * (sp - spl) / (spu - sp)
@@ -712,12 +730,6 @@ def _optimize_ratio(
     else:
         current_ratio = raw1 / raw0
 
-    direction = ""
-    if current_ratio > target_ratio:
-        direction = "token1 -> token0"
-    elif current_ratio < target_ratio:
-        direction = "token0 -> token1"
-
     deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
     if deviation < 0.01:
         logger.info(f"Ratio deviation {deviation:.4f} < 1%, no swap needed")
@@ -726,20 +738,22 @@ def _optimize_ratio(
     pool_fee = pool_contract.functions.fee().call()
 
     if current_ratio > target_ratio:
-        excess_raw1 = raw1 - int(target_ratio * raw0)
-        swap_raw = int(excess_raw1 * 0.95)
+        numerator = raw1 - int(target_ratio * raw0)
+        denominator = 1.0 + target_ratio / p
+        swap_raw = int(numerator / denominator * 0.99)
         if swap_raw >= 1000:
-            logger.info(f"Single ratio swap: {direction} (deviation={deviation:.4f})")
+            logger.info(f"One-shot swap: token1->token0 (deviation={deviation:.4f})")
             t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
             t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
             approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
                           config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
             swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
     else:
-        excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
-        swap_raw = int(excess_raw0 * 0.95)
+        numerator = int(target_ratio * raw0) - raw1
+        denominator = p + target_ratio
+        swap_raw = int(numerator / denominator * 0.99)
         if swap_raw >= 1000:
-            logger.info(f"Single ratio swap: {direction} (deviation={deviation:.4f})")
+            logger.info(f"One-shot swap: token0->token1 (deviation={deviation:.4f})")
             t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
             t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
             approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
