@@ -356,51 +356,7 @@ def add_to_position(
     else:
         raw0, raw1 = usdc_bal, hype_bal
 
-    import math
-    Q96 = 2 ** 96
-    sp = sqrt_price_x96 / Q96
-    spl = math.sqrt(1.0001 ** tick_lower)
-    spu = math.sqrt(1.0001 ** tick_upper)
-    target_ratio = sp * spu * (sp - spl) / (spu - sp)
-
-    for iteration in range(5):
-        current_ratio = raw1 / raw0 if raw0 > 0 else float('inf')
-        deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
-        if deviation < 0.01:
-            break
-
-        if current_ratio > target_ratio:
-            excess_usd = (raw1 - target_ratio * raw0) / 10**config.USDC_DECIMALS if token0_is_hype else (raw1 - target_ratio * raw0) / 10**config.HYPE_DECIMALS * current_price
-        else:
-            excess_usd = (raw0 - raw1 / target_ratio) * current_price / 10**config.HYPE_DECIMALS if token0_is_hype else (raw0 - raw1 / target_ratio) / 10**config.USDC_DECIMALS
-
-        if excess_usd < 2.0:
-            break
-
-        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
-        if current_ratio > target_ratio:
-            excess_raw1 = raw1 - int(target_ratio * raw0)
-            swap_raw = int(excess_raw1 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                logger.info(f"Add-to-position swap iter {iteration}: token1 -> token0")
-                approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-        else:
-            excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
-            swap_raw = int(excess_raw0 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                logger.info(f"Add-to-position swap iter {iteration}: token0 -> token1")
-                approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-
-        hype_bal, usdc_bal = get_token_balances(w3)
-        raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
@@ -457,7 +413,7 @@ def rebalance(
     collect_fees(w3, position_manager, token_id, dry_run)
 
     logger.info("Step 4: Balancing tokens...")
-    balance_tokens(w3, pool_contract, dry_run)
+    balance_tokens(w3, dry_run)
 
     logger.info("Step 5: Calculating new bounds...")
     tick_lower, tick_upper, actual_lower, actual_upper = calculate_bounds(
@@ -478,7 +434,6 @@ def rebalance(
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
     from src.math_utils import calculate_token_amounts
-    import math
 
     if token0_is_hype:
         raw0, raw1 = hype_bal, usdc_bal
@@ -491,51 +446,8 @@ def rebalance(
 
     pool_fee = pool_contract.functions.fee().call()
 
-    # Pre-mint: iteratively swap to match the pool's required ratio for near-full utilization
-    Q96 = 2 ** 96
-    sp = sqrt_price_x96 / Q96
-    spl = math.sqrt(1.0001 ** tick_lower)
-    spu = math.sqrt(1.0001 ** tick_upper)
-    target_ratio = sp * spu * (sp - spl) / (spu - sp)  # raw1 / raw0 for full utilization
-
-    for iteration in range(5):
-        current_ratio = raw1 / raw0 if raw0 > 0 else float('inf')
-        deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
-        if deviation < 0.01:
-            break
-
-        if current_ratio > target_ratio:
-            excess_usd = (raw1 - target_ratio * raw0) / 10**config.USDC_DECIMALS if token0_is_hype else (raw1 - target_ratio * raw0) / 10**config.HYPE_DECIMALS * current_price
-        else:
-            excess_usd = (raw0 - raw1 / target_ratio) * current_price / 10**config.HYPE_DECIMALS if token0_is_hype else (raw0 - raw1 / target_ratio) / 10**config.USDC_DECIMALS
-
-        if excess_usd < 2.0:
-            break
-
-        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
-        if current_ratio > target_ratio:
-            excess_raw1 = raw1 - int(target_ratio * raw0)
-            swap_raw = int(excess_raw1 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                logger.info(f"Pre-mint swap iter {iteration}: token1 -> token0, ~${excess_usd:.1f} excess")
-                approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-        else:
-            excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
-            swap_raw = int(excess_raw0 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                logger.info(f"Pre-mint swap iter {iteration}: token0 -> token1, ~${excess_usd:.1f} excess")
-                approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-
-        hype_bal, usdc_bal = get_token_balances(w3)
-        raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+    logger.info("Step 5b: Optimizing token ratio...")
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
 
     am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
     amount0_desired = max(am0_opt, 1)
@@ -639,7 +551,7 @@ def create_position(
     logger.info("=== Creating new position ===")
 
     logger.info("Step 0: Balancing tokens...")
-    balance_tokens(w3, pool_contract, dry_run)
+    balance_tokens(w3, dry_run)
 
     logger.info("Step 1: Calculating bounds...")
     tick_lower, tick_upper, actual_lower, actual_upper = calculate_bounds(
@@ -671,51 +583,9 @@ def create_position(
         return None
 
     pool_fee = pool_contract.functions.fee().call()
-    import math
-    Q96 = 2 ** 96
-    sp = sqrt_price_x96 / Q96
-    spl = math.sqrt(1.0001 ** tick_lower)
-    spu = math.sqrt(1.0001 ** tick_upper)
-    target_ratio = sp * spu * (sp - spl) / (spu - sp)
 
-    for iteration in range(5):
-        current_ratio = raw1 / raw0 if raw0 > 0 else float('inf')
-        deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
-        if deviation < 0.01:
-            break
-
-        if current_ratio > target_ratio:
-            excess_usd = (raw1 - target_ratio * raw0) / 10**config.USDC_DECIMALS if token0_is_hype else (raw1 - target_ratio * raw0) / 10**config.HYPE_DECIMALS * current_price
-        else:
-            excess_usd = (raw0 - raw1 / target_ratio) * current_price / 10**config.HYPE_DECIMALS if token0_is_hype else (raw0 - raw1 / target_ratio) / 10**config.USDC_DECIMALS
-
-        if excess_usd < 2.0:
-            break
-
-        swap_frac = min(0.50, 25.0 / max(excess_usd, 1.0))
-        if current_ratio > target_ratio:
-            excess_raw1 = raw1 - int(target_ratio * raw0)
-            swap_raw = int(excess_raw1 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                logger.info(f"Pre-mint swap iter {iteration}: token1 -> token0, ~${excess_usd:.1f} excess")
-                approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-        else:
-            excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
-            swap_raw = int(excess_raw0 * swap_frac * 0.95)
-            if swap_raw >= 1000:
-                t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                logger.info(f"Pre-mint swap iter {iteration}: token0 -> token1, ~${excess_usd:.1f} excess")
-                approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
-                              config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
-                swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
-
-        hype_bal, usdc_bal = get_token_balances(w3)
-        raw0, raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+    logger.info("Step 1b: Optimizing token ratio...")
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
 
     am0_opt, am1_opt = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
     amount0_desired = max(am0_opt, 1)
@@ -799,13 +669,11 @@ def swap_exact_input_single(
 
 def balance_tokens(
     w3: Web3,
-    pool_contract,
     dry_run: bool = False,
 ):
     account = get_account(w3)
     native_balance = w3.eth.get_balance(account.address)
 
-    # Wrap native HYPE to wHYPE, keeping small gas reserve
     gas_reserve_wei = int(0.01 * 1e18)
     wrap_amount = native_balance - gas_reserve_wei
     if wrap_amount > 0:
@@ -819,54 +687,68 @@ def balance_tokens(
 
     if hype_bal == 0 and usdc_bal == 0:
         logger.warning("No wHYPE or USDC available after wrapping")
-        return
 
-    # Simple 50/50 value balancing
-    if hype_bal > 0 and usdc_bal == 0:
-        slot0 = pool_contract.functions.slot0().call()
-        tick = slot0[1]
-        from src.provider import get_hype_contract
-        from src.math_utils import tick_to_price, get_token_order
-        token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
-        invert = not token0_is_hype
-        price = tick_to_price(tick, dec0, dec1, invert)
 
-        half_value_in_hype = hype_bal // 2
-        logger.info(f"Swapping half wHYPE (~{half_value_in_hype / 1e18:.4f}) for USDC")
+def _optimize_ratio(
+    w3: Web3,
+    pool_contract,
+    tick_lower: int,
+    tick_upper: int,
+    sqrt_price_x96: int,
+    token0_is_hype: bool,
+    raw0: int,
+    raw1: int,
+    dry_run: bool = False,
+) -> Tuple[int, int]:
+    import math
+    Q96 = 2 ** 96
+    sp = sqrt_price_x96 / Q96
+    spl = math.sqrt(1.0001 ** tick_lower)
+    spu = math.sqrt(1.0001 ** tick_upper)
+    target_ratio = sp * spu * (sp - spl) / (spu - sp)
 
-        fee = pool_contract.functions.fee().call()
-        approve_token(
-            w3, get_hype_contract(w3),
-            Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS),
-            half_value_in_hype, dry_run,
-        )
-        swap_exact_input_single(
-            w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
-            fee, half_value_in_hype, dry_run,
-        )
-    elif usdc_bal > 0 and hype_bal == 0:
-        slot0 = pool_contract.functions.slot0().call()
-        tick = slot0[1]
-        from src.math_utils import tick_to_price, get_token_order
-        token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
-        invert = not token0_is_hype
-        price = tick_to_price(tick, dec0, dec1, invert)
-
-        half_value_in_usdc = usdc_bal // 2
-        logger.info(f"Swapping half USDC (~${half_value_in_usdc / 1e6:.2f}) for wHYPE")
-
-        fee = pool_contract.functions.fee().call()
-        approve_token(
-            w3, get_hype_or_usdc(w3, False),
-            Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS),
-            half_value_in_usdc, dry_run,
-        )
-        swap_exact_input_single(
-            w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
-            fee, half_value_in_usdc, dry_run,
-        )
+    if raw0 <= 0 or raw1 <= 0:
+        current_ratio = float('inf') if raw0 <= 0 else 0.0
     else:
-        logger.info("Both tokens present, skipping swap")
+        current_ratio = raw1 / raw0
+
+    direction = ""
+    if current_ratio > target_ratio:
+        direction = "token1 -> token0"
+    elif current_ratio < target_ratio:
+        direction = "token0 -> token1"
+
+    deviation = abs(math.log(current_ratio / target_ratio)) if current_ratio > 0 and target_ratio > 0 else 1.0
+    if deviation < 0.01:
+        logger.info(f"Ratio deviation {deviation:.4f} < 1%, no swap needed")
+        return raw0, raw1
+
+    pool_fee = pool_contract.functions.fee().call()
+
+    if current_ratio > target_ratio:
+        excess_raw1 = raw1 - int(target_ratio * raw0)
+        swap_raw = int(excess_raw1 * 0.95)
+        if swap_raw >= 1000:
+            logger.info(f"Single ratio swap: {direction} (deviation={deviation:.4f})")
+            t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+            t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+            approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                          config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+            swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
+    else:
+        excess_raw0 = raw0 - int(raw1 / target_ratio) if target_ratio > 0 else raw0
+        swap_raw = int(excess_raw0 * 0.95)
+        if swap_raw >= 1000:
+            logger.info(f"Single ratio swap: {direction} (deviation={deviation:.4f})")
+            t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+            t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+            approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                          config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
+            swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
+
+    hype_bal, usdc_bal = get_token_balances(w3)
+    new_raw0, new_raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+    return new_raw0, new_raw1
 
 
 def get_hype_or_usdc(w3: Web3, is_hype: bool):
