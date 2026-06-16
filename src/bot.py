@@ -46,23 +46,23 @@ def signal_handler(sig, frame):
     running = False
 
 
-def _secondary_cycle():
+def _downward_cycle():
     global running, tx_lock, token_id_ref
 
-    logger.info(f"[SECONDARY] Initial delay {config.SECONDARY_CYCLE_INTERVAL}s before first cycle")
-    for _ in range(config.SECONDARY_CYCLE_INTERVAL):
+    logger.info(f"[DOWNWARD] Initial delay {config.DOWNWARD_CYCLE_INTERVAL}s before first cycle")
+    for _ in range(config.DOWNWARD_CYCLE_INTERVAL):
         if not running:
             return
         sleep(1)
 
     while running:
         cycle_start = time()
-        logger.info("[SECONDARY] Cycle start")
+        logger.info("[DOWNWARD] Cycle start")
 
         if tx_lock.locked():
-            logger.info("[SECONDARY] Main cycle active, skipping RPC reads")
+            logger.info("[DOWNWARD] Main cycle active, skipping RPC reads")
             elapsed = time() - cycle_start
-            remaining = config.SECONDARY_CYCLE_INTERVAL - elapsed
+            remaining = config.DOWNWARD_CYCLE_INTERVAL - elapsed
             for _ in range(int(max(remaining, 0))):
                 if not running:
                     break
@@ -93,17 +93,16 @@ def _secondary_cycle():
                 lower_price = tick_to_price(pos["tickLower"], dec0, dec1, invert)
                 upper_price = tick_to_price(pos["tickUpper"], dec0, dec1, invert)
                 trigger_price = lower_price * config.HYPE_DROP_THRESHOLD
-                upper_trigger_price = upper_price * config.HYPE_UPPER_THRESHOLD
 
                 logger.info(
-                    f"[SECONDARY] Price=${current_price:.4f} "
+                    f"[DOWNWARD] Price=${current_price:.4f} "
                     f"lower=${lower_price:.4f} upper=${upper_price:.4f} "
-                    f"drop_trigger=${trigger_price:.4f} surge_trigger=${upper_trigger_price:.4f}"
+                    f"drop_trigger=${trigger_price:.4f}"
                 )
 
                 if current_price < trigger_price:
                     logger.warning(
-                        f"[SECONDARY] Price ${current_price:.4f} dropped >2% "
+                        f"[DOWNWARD] Price ${current_price:.4f} dropped >{((1 - config.HYPE_DROP_THRESHOLD) * 100):.0f}% "
                         f"below lower bound ${lower_price:.4f}. Closing position..."
                     )
                     with tx_lock:
@@ -124,9 +123,9 @@ def _secondary_cycle():
                                     w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
                                     pool_fee, hype_bal, config.DRY_RUN,
                                 )
-                                logger.info("[SECONDARY] Position closed, all wHYPE swapped to USDC")
+                                logger.info("[DOWNWARD] Position closed, all wHYPE swapped to USDC")
                         except TxFeeExceeded as e:
-                            logger.warning(f"[SECONDARY] {e}, skipping to next cycle with 60s delay")
+                            logger.warning(f"[DOWNWARD] {e}, skipping to next cycle with 60s delay")
                             elapsed = time() - cycle_start
                             remaining = 60
                             for _ in range(int(max(remaining, 0))):
@@ -134,22 +133,91 @@ def _secondary_cycle():
                                     break
                                 sleep(1)
                             continue
-                elif current_price > upper_trigger_price:
+                else:
+                    logger.info("[DOWNWARD] Price above drop threshold, no action")
+            else:
+                logger.info("[DOWNWARD] No active position")
+
+        except Exception as e:
+            logger.warning(f"[DOWNWARD] Cycle error: {e}")
+
+        elapsed = time() - cycle_start
+        remaining = config.DOWNWARD_CYCLE_INTERVAL - elapsed
+        for _ in range(int(max(remaining, 0))):
+            if not running:
+                break
+            sleep(1)
+
+
+def _upward_cycle():
+    global running, tx_lock, token_id_ref
+
+    logger.info(f"[UPWARD] Initial delay {config.UPWARD_CYCLE_INTERVAL}s before first cycle")
+    for _ in range(config.UPWARD_CYCLE_INTERVAL):
+        if not running:
+            return
+        sleep(1)
+
+    while running:
+        cycle_start = time()
+        logger.info("[UPWARD] Cycle start")
+
+        if tx_lock.locked():
+            logger.info("[UPWARD] Main cycle active, skipping RPC reads")
+            elapsed = time() - cycle_start
+            remaining = config.UPWARD_CYCLE_INTERVAL - elapsed
+            for _ in range(int(max(remaining, 0))):
+                if not running:
+                    break
+                sleep(1)
+            continue
+
+        try:
+            w3 = get_web3()
+            pool = get_pool_contract(w3)
+            pm = get_position_manager_contract(w3)
+            pool_t0 = pool.functions.token0().call()
+            pool_t1 = pool.functions.token1().call()
+
+            tid = token_id_ref[0]
+            pos = None
+            if tid > 0:
+                pos = get_position_details(w3, pm, tid)
+            if not pos or pos["liquidity"] == 0:
+                new_id, pos = _auto_discover_position(w3, pm, pool_t0, pool_t1)
+                if new_id is not None:
+                    token_id_ref[0] = new_id
+                    tid = new_id
+
+            if pos and pos["liquidity"] > 0:
+                current_price, current_tick, _ = get_current_price(w3, pool)
+                token0_is_hype, dec0, dec1 = get_token_order(pool, config.HYPE_ADDRESS)
+                invert = not token0_is_hype
+                upper_price = tick_to_price(pos["tickUpper"], dec0, dec1, invert)
+                upper_trigger_price = upper_price * config.HYPE_UPPER_THRESHOLD
+
+                logger.info(
+                    f"[UPWARD] Price=${current_price:.4f} "
+                    f"upper=${upper_price:.4f} "
+                    f"surge_trigger=${upper_trigger_price:.4f}"
+                )
+
+                if current_price > upper_trigger_price:
                     logger.warning(
-                        f"[SECONDARY] Price ${current_price:.4f} surged >{((config.HYPE_UPPER_THRESHOLD - 1) * 100):.0f}% "
+                        f"[UPWARD] Price ${current_price:.4f} surged >{((config.HYPE_UPPER_THRESHOLD - 1) * 100):.0f}% "
                         f"above upper bound ${upper_price:.4f}. Signaling main cycle to skip sleep..."
                     )
                     upper_threshold_event.set()
                 else:
-                    logger.info("[SECONDARY] Price within threshold, no action")
+                    logger.info("[UPWARD] Price below surge threshold, no action")
             else:
-                logger.info("[SECONDARY] No active position")
+                logger.info("[UPWARD] No active position")
 
         except Exception as e:
-            logger.warning(f"[SECONDARY] Cycle error: {e}")
+            logger.warning(f"[UPWARD] Cycle error: {e}")
 
         elapsed = time() - cycle_start
-        remaining = config.SECONDARY_CYCLE_INTERVAL - elapsed
+        remaining = config.UPWARD_CYCLE_INTERVAL - elapsed
         for _ in range(int(max(remaining, 0))):
             if not running:
                 break
@@ -176,14 +244,19 @@ def run_bot():
         f"LOWER={config.LOWER_BOUND_PCT}, UPPER={config.UPPER_BOUND_PCT}"
     )
     logger.info(
-        f"Secondary protection cycle: interval={config.SECONDARY_CYCLE_INTERVAL}s, "
-        f"drop_threshold={config.HYPE_DROP_THRESHOLD}, "
+        f"Downward protection cycle: interval={config.DOWNWARD_CYCLE_INTERVAL}s, "
+        f"drop_threshold={config.HYPE_DROP_THRESHOLD}"
+    )
+    logger.info(
+        f"Upward surge cycle: interval={config.UPWARD_CYCLE_INTERVAL}s, "
         f"upper_threshold={config.HYPE_UPPER_THRESHOLD}"
     )
 
     token_id_ref[0] = token_id
-    secondary_thread = threading.Thread(target=_secondary_cycle, daemon=True)
-    secondary_thread.start()
+    downward_thread = threading.Thread(target=_downward_cycle, daemon=True)
+    upward_thread = threading.Thread(target=_upward_cycle, daemon=True)
+    downward_thread.start()
+    upward_thread.start()
 
     while running:
         cycle_error = False

@@ -42,7 +42,7 @@ BOT_UPPER_BOUND_PCT = 1.06
 BOT_FEE_TIER = 3000
 BOT_TICK_SPACING = TICK_SPACINGS[BOT_FEE_TIER]
 BOT_HYPE_DROP_THRESHOLD = 0.98
-BOT_SECONDARY_INTERVAL = 600
+BOT_DOWNWARD_INTERVAL = 600
 BOT_SLEEP_INTERVAL = 3600
 BOT_HYPE_DECIMALS = 18
 BOT_USDC_DECIMALS = 6
@@ -477,7 +477,7 @@ class Backtest:
         initial_price = prices[0][1]
         initial_total = self._wallet_val(initial_price)
         last_cycle_ts: Optional[int] = None
-        last_secondary_ts: Optional[int] = None
+        last_downward_ts: Optional[int] = None
 
         total_steps = len(prices)
         log_every = max(1, total_steps // 100)  # log ~100 lines
@@ -498,10 +498,10 @@ class Backtest:
 
             tick = price_to_tick(price)
 
-            # 2. Secondary cycle (anti-IL)
-            if (last_secondary_ts is None
-                or (ts - last_secondary_ts) >= BOT_SECONDARY_INTERVAL):
-                last_secondary_ts = ts
+            # 2. Downward cycle (anti-IL)
+            if (last_downward_ts is None
+                or (ts - last_downward_ts) >= BOT_DOWNWARD_INTERVAL):
+                last_downward_ts = ts
                 if self.pos is not None:
                     lower_p = tick_to_price(
                         self.pos.tick_lower, BOT_HYPE_DECIMALS, BOT_USDC_DECIMALS, self.invert,
