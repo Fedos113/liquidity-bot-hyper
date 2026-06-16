@@ -214,6 +214,8 @@ class Backtest:
         self.swaps = 0
         self.secondary_triggers = 0
         self.history: list[tuple[int, float, float, float, float, float]] = []
+        self._add_to_position_call_count = 0
+        self._compound_fees_call_count = 0
 
     # -- helpers -----------------------------------------------------------
 
@@ -238,6 +240,7 @@ class Backtest:
         """Accrue fees for the current step and compound into the position."""
         if self.pos is None or self.pos.liquidity == 0:
             return
+        self._compound_fees_call_count += 1
 
         tick = price_to_tick(price)
         in_range = self.pos.tick_lower <= tick < self.pos.tick_upper
@@ -445,6 +448,7 @@ class Backtest:
             return
         if self._wallet_val(price) < BOT_WALLET_MIN:
             return
+        self._add_to_position_call_count += 1
 
         self._optimize_ratio(price)
 
@@ -584,6 +588,8 @@ class Backtest:
             "adds": self.adds,
             "swaps": self.swaps,
             "secondary_triggers": self.secondary_triggers,
+            "compound_fees_calls": self._compound_fees_call_count,
+            "add_to_position_calls": self._add_to_position_call_count,
             "steps": len(self.history),
             "history": self.history,
         }
@@ -651,6 +657,7 @@ def main():
     print(f"  Swaps:            {result['swaps']}")
     print(f"  Anti-IL triggers: {result['secondary_triggers']}")
     print(f"  Fees earned:      ${result['fees_earned']:.2f}")
+    print(f"  DEBUG: compound_fees_calls={result['compound_fees_calls']}, add_to_position_calls={result['add_to_position_calls']}")
     print(sep)
 
     if args.output:

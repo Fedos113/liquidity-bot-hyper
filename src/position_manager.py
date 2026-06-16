@@ -13,6 +13,7 @@ logger = logging.getLogger("liqbot")
 
 _hype_price_usd: Optional[float] = None
 MAX_TX_FEE_USD = 0.05
+GAS_RESERVE_HYPE = 0.02
 
 
 class TxFeeExceeded(Exception):
@@ -699,7 +700,7 @@ def balance_tokens(
     account = get_account(w3)
     native_balance = w3.eth.get_balance(account.address)
 
-    gas_reserve_wei = int(0.01 * 1e18)
+    gas_reserve_wei = int(GAS_RESERVE_HYPE * 1e18)
     wrap_amount = native_balance - gas_reserve_wei
     if wrap_amount > 0:
         wrap_hype(w3, wrap_amount, dry_run)
