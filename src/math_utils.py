@@ -39,21 +39,21 @@ def get_tick_spacing(pool_contract) -> int:
             return 60
 
 
-def get_token_order(pool_contract, hype_address: str) -> Tuple[bool, int, int]:
+def get_token_order(pool_contract, native_address: str) -> Tuple[bool, int, int]:
     token0 = pool_contract.functions.token0().call()
     token1 = pool_contract.functions.token1().call()
     token0_addr = token0.lower()
     token1_addr = token1.lower()
-    hype_lower = hype_address.lower()
-    token0_is_hype = token0_addr == hype_lower
+    native_lower = native_address.lower()
+    token0_is_native = token0_addr == native_lower
 
-    if not token0_is_hype and token1_addr != hype_lower:
-        raise ValueError(f"HYPE address {hype_address} not found in pool. token0={token0}, token1={token1}")
+    if not token0_is_native and token1_addr != native_lower:
+        raise ValueError(f"Native token address {native_address} not found in pool. token0={token0}, token1={token1}")
 
     from src.config import config
-    decimals0 = config.HYPE_DECIMALS if token0_is_hype else config.USDC_DECIMALS
-    decimals1 = config.HYPE_DECIMALS if not token0_is_hype else config.USDC_DECIMALS
-    return token0_is_hype, decimals0, decimals1
+    decimals0 = config.NATIVE_DECIMALS if token0_is_native else config.USDC_DECIMALS
+    decimals1 = config.NATIVE_DECIMALS if not token0_is_native else config.USDC_DECIMALS
+    return token0_is_native, decimals0, decimals1
 
 
 def calculate_bounds(

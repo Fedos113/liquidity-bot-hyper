@@ -6,10 +6,9 @@ from time import sleep
 
 from web3 import Web3
 from web3.exceptions import Web3Exception
-from web3.middleware import ExtraDataToPOAMiddleware
 
 from src.config import config
-from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI, WHYPE_ABI, SWAP_ROUTER_ABI
+from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI, WETH_ABI, SWAP_ROUTER_ABI, GAUGE_ABI
 
 logger = logging.getLogger("liqbot")
 
@@ -45,10 +44,9 @@ def with_retry(max_retries: int = 5, base_delay: int = 1):
 
 def get_web3() -> Web3:
     w3 = Web3(Web3.HTTPProvider(config.RPC_URL, request_kwargs={"timeout": 30}))
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
         raise ConnectionError(f"Failed to connect to RPC: {config.RPC_URL}")
-    logger.info(f"Connected to HyperEVM. Chain ID: {w3.eth.chain_id}")
+    logger.info(f"Connected to Base. Chain ID: {w3.eth.chain_id}")
     return w3
 
 
@@ -66,20 +64,24 @@ def get_erc20_contract(w3: Web3, address: str):
     return w3.eth.contract(address=Web3.to_checksum_address(address), abi=ERC20_ABI)
 
 
-def get_hype_contract(w3: Web3):
-    return get_erc20_contract(w3, config.HYPE_ADDRESS)
+def get_weth_contract(w3: Web3):
+    return get_erc20_contract(w3, config.WETH_ADDRESS)
 
 
 def get_usdc_contract(w3: Web3):
     return get_erc20_contract(w3, config.USDC_ADDRESS)
 
 
-def get_whype_contract(w3: Web3):
-    return w3.eth.contract(address=Web3.to_checksum_address(config.HYPE_ADDRESS), abi=WHYPE_ABI)
+def get_wnative_contract(w3: Web3):
+    return w3.eth.contract(address=Web3.to_checksum_address(config.WETH_ADDRESS), abi=WETH_ABI)
 
 
 def get_swap_router_contract(w3: Web3):
     return w3.eth.contract(address=Web3.to_checksum_address(config.SWAP_ROUTER_ADDRESS), abi=SWAP_ROUTER_ABI)
+
+
+def get_gauge_contract(w3: Web3):
+    return w3.eth.contract(address=Web3.to_checksum_address(config.GAUGE_ADDRESS), abi=GAUGE_ABI)
 
 
 def get_account(w3: Web3):

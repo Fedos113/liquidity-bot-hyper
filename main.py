@@ -16,7 +16,7 @@ def setup_logging(level: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HYPE/USDC Concentrated Liquidity Bot")
+    parser = argparse.ArgumentParser(description="WETH/USDC Concentrated Liquidity Bot (Base/Aerodrome)")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -42,7 +42,7 @@ def main():
 
     setup_logging(config.LOG_LEVEL)
     logger = logging.getLogger("liqbot")
-    logger.info("=== HYPE/USDC Liquidity Bot ===")
+    logger.info("=== WETH/USDC Liquidity Bot (Base) ===")
 
     try:
         from src.bot import run_bot

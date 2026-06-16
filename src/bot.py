@@ -25,11 +25,13 @@ from src.position_manager import (
     increase_liquidity,
     get_token_balances,
     approve_token,
-    get_hype_or_usdc,
-    wrap_hype,
+    get_native_or_usdc,
+    wrap_eth,
     swap_exact_input_single,
+    stake_position,
+    unstake_position,
     TxFeeExceeded,
-    set_hype_price,
+    set_native_price,
 )
 
 logger = logging.getLogger("liqbot")
@@ -87,10 +89,10 @@ def _secondary_cycle():
 
             if pos and pos["liquidity"] > 0:
                 current_price, current_tick, _ = get_current_price(w3, pool)
-                token0_is_hype, dec0, dec1 = get_token_order(pool, config.HYPE_ADDRESS)
+                token0_is_hype, dec0, dec1 = get_token_order(pool, config.WETH_ADDRESS)
                 invert = not token0_is_hype
                 lower_price = tick_to_price(pos["tickLower"], dec0, dec1, invert)
-                trigger_price = lower_price * config.HYPE_DROP_THRESHOLD
+                trigger_price = lower_price * config.DROP_THRESHOLD
 
                 logger.info(
                     f"[SECONDARY] Price=${current_price:.4f} "
@@ -103,24 +105,25 @@ def _secondary_cycle():
                         f"below lower bound ${lower_price:.4f}. Closing position..."
                     )
                     with tx_lock:
-                        set_hype_price(current_price)
+                        set_native_price(current_price)
                         try:
+                            unstake_position(w3, tid, config.DRY_RUN)
                             collect_fees(w3, pm, tid, config.DRY_RUN)
                             remove_liquidity(w3, pm, tid, pos["liquidity"], config.DRY_RUN)
                             collect_fees(w3, pm, tid, config.DRY_RUN)
 
-                            hype_bal, usdc_bal = get_token_balances(w3)
-                            if hype_bal > 0:
+                            weth_bal, usdc_bal = get_token_balances(w3)
+                            if weth_bal > 0:
                                 pool_fee = pool.functions.fee().call()
                                 approve_token(
-                                    w3, get_hype_or_usdc(w3, True),
-                                    config.SWAP_ROUTER_ADDRESS, hype_bal, config.DRY_RUN,
+                                    w3, get_native_or_usdc(w3, True),
+                                    config.SWAP_ROUTER_ADDRESS, weth_bal, config.DRY_RUN,
                                 )
                                 swap_exact_input_single(
-                                    w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
-                                    pool_fee, hype_bal, config.DRY_RUN,
+                                    w3, config.WETH_ADDRESS, config.USDC_ADDRESS,
+                                    pool_fee, weth_bal, config.DRY_RUN,
                                 )
-                                logger.info("[SECONDARY] Position closed, all wHYPE swapped to USDC")
+                                logger.info("[SECONDARY] Position closed, all WETH swapped to USDC")
                         except TxFeeExceeded as e:
                             logger.warning(f"[SECONDARY] {e}, skipping to next cycle with 60s delay")
                             elapsed = time() - cycle_start
@@ -160,14 +163,14 @@ def run_bot():
         logger.info("DRY-RUN MODE: No transactions will be sent")
         logger.info("=" * 50)
 
-    logger.info("Starting HYPE/USDC Liquidity Bot")
+    logger.info("Starting WETH/USDC Liquidity Bot")
     logger.info(
         f"SLEEP_INTERVAL={config.SLEEP_INTERVAL}s, "
         f"LOWER={config.LOWER_BOUND_PCT}, UPPER={config.UPPER_BOUND_PCT}"
     )
     logger.info(
         f"Secondary protection cycle: interval={config.SECONDARY_CYCLE_INTERVAL}s, "
-        f"drop_threshold={config.HYPE_DROP_THRESHOLD}"
+        f"drop_threshold={config.DROP_THRESHOLD}"
     )
 
     token_id_ref[0] = token_id
@@ -189,10 +192,10 @@ def run_bot():
             pool_t1 = pool.functions.token1().call()
 
             current_price, current_tick, sqrt_price_x96 = get_current_price(w3, pool)
-            logger.info(f"Current price: {current_price:.6f} USDC/HYPE")
+            logger.info(f"Current price: {current_price:.6f} USDC/WETH")
             logger.info(f"Current tick: {current_tick}")
 
-            token0_is_hype, dec0, dec1 = get_token_order(pool, config.HYPE_ADDRESS)
+            token0_is_hype, dec0, dec1 = get_token_order(pool, config.WETH_ADDRESS)
             tick_spacing = get_tick_spacing(pool)
             invert = not token0_is_hype
 
@@ -207,13 +210,13 @@ def run_bot():
                     token_id_ref[0] = new_id
                     config.TOKEN_ID = new_id
 
-            set_hype_price(current_price)
+            set_native_price(current_price)
             try:
                 with tx_lock:
                     if pos and pos["liquidity"] > 0:
                         lower_price = tick_to_price(pos["tickLower"], dec0, dec1, invert)
                         upper_price = tick_to_price(pos["tickUpper"], dec0, dec1, invert)
-                        logger.info(f"Position: [{lower_price:.4f} - {upper_price:.4f}] USDC/HYPE")
+                        logger.info(f"Position: [{lower_price:.4f} - {upper_price:.4f}] USDC/WETH")
                         logger.info(f"Liquidity: {pos['liquidity']}")
 
                         pos_val = position_value_usd(
@@ -226,7 +229,7 @@ def run_bot():
                         wallet_val = calculate_usdc_value(
                             current_price,
                             usdc_bal / 10 ** config.USDC_DECIMALS,
-                            hype_bal / 10 ** config.HYPE_DECIMALS,
+                            hype_bal / 10 ** config.NATIVE_DECIMALS,
                         )
                         logger.info(f"Wallet value: ~${wallet_val:.2f}")
 
@@ -236,6 +239,7 @@ def run_bot():
                             if not in_range:
                                 direction = "below" if current_price < lower_price else "above"
                                 logger.warning(f"Position out of bounds ({direction}), closing and recreating...")
+                                unstake_position(w3, token_id, dry_run)
                                 collect_fees(w3, pm, token_id, dry_run)
                                 remove_liquidity(w3, pm, token_id, pos["liquidity"], dry_run)
                                 collect_fees(w3, pm, token_id, dry_run)
@@ -269,13 +273,14 @@ def run_bot():
                                     logger.info(f"Fees ~${fee_val_usd:.2f} above threshold, compounding...")
                                     am0, am1 = collect_fees(w3, pm, token_id, dry_run)
                                     if (am0 or 0) > 0 or (am1 or 0) > 0:
-                                        approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                                        approve_token(w3, get_native_or_usdc(w3, token0_is_hype),
                                                       config.POSITION_MANAGER_ADDRESS, am0 or 0, dry_run)
-                                        approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                                        approve_token(w3, get_native_or_usdc(w3, not token0_is_hype),
                                                       config.POSITION_MANAGER_ADDRESS, am1 or 0, dry_run)
                                         increase_liquidity(w3, pm, token_id, am0 or 0, am1 or 0, dry_run)
                         else:
                             logger.warning(f"Position value ${pos_val:.2f} <= $1, closing and recreating...")
+                            unstake_position(w3, token_id, dry_run)
                             collect_fees(w3, pm, token_id, dry_run)
                             remove_liquidity(w3, pm, token_id, pos["liquidity"], dry_run)
                             collect_fees(w3, pm, token_id, dry_run)
@@ -339,6 +344,8 @@ def _auto_discover_position(w3, pm, pool_t0, pool_t1):
         {"constant": True, "inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
         {"constant": True, "inputs": [{"name": "owner", "type": "address"}, {"name": "index", "type": "uint256"}], "name": "tokenOfOwnerByIndex", "outputs": [{"name": "tokenId", "type": "uint256"}], "type": "function"},
     ]
+
+    # Check position manager (unstaked positions)
     erc721 = w3.eth.contract(address=pm.address, abi=_ERC721_ABI)
     try:
         balance = erc721.functions.balanceOf(account.address).call()
@@ -354,4 +361,25 @@ def _auto_discover_position(w3, pm, pool_t0, pool_t1):
                 pass
     except Exception:
         pass
+
+    # Check gauge contract (staked positions)
+    if config.GAUGE_ADDRESS:
+        from src.provider import get_gauge_contract
+        gauge = get_gauge_contract(w3)
+        try:
+            gauge_erc721 = w3.eth.contract(address=gauge.address, abi=_ERC721_ABI)
+            balance = gauge_erc721.functions.balanceOf(account.address).call()
+            for i in range(balance):
+                tid = gauge_erc721.functions.tokenOfOwnerByIndex(account.address, i).call()
+                try:
+                    raw = pm.functions.positions(tid).call()
+                    if raw[2].lower() == pool_t0.lower() and raw[3].lower() == pool_t1.lower() and raw[7] > 0:
+                        pos = get_position_details(w3, pm, tid)
+                        logger.info(f"Auto-discovered staked position {tid} with liquidity {raw[7]}")
+                        return tid, pos
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return None, None

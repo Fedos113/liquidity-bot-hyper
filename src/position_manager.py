@@ -11,18 +11,18 @@ from src.math_utils import get_tick_spacing, get_token_order, calculate_bounds, 
 
 logger = logging.getLogger("liqbot")
 
-_hype_price_usd: Optional[float] = None
+_native_price_usd: Optional[float] = None
 MAX_TX_FEE_USD = 0.05
-GAS_RESERVE_HYPE = 0.02
+GAS_RESERVE_ETH = 0.0014
 
 
 class TxFeeExceeded(Exception):
     pass
 
 
-def set_hype_price(price: float) -> None:
-    global _hype_price_usd
-    _hype_price_usd = price
+def set_native_price(price: float) -> None:
+    global _native_price_usd
+    _native_price_usd = price
 
 
 def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxReceipt]:
@@ -40,11 +40,11 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
         gas_used = receipt["gasUsed"]
         gas_price = receipt.get("effectiveGasPrice", tx.get("gasPrice", 0))
         gas_cost_wei = gas_used * gas_price
-        gas_cost_hype = gas_cost_wei / 1e18
-        logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {gas_used}, fee: {gas_cost_hype:.9f} HYPE)")
+        gas_cost_eth = gas_cost_wei / 1e18
+        logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {gas_used}, fee: {gas_cost_eth:.9f} ETH)")
 
-        if _hype_price_usd is not None:
-            gas_cost_usd = gas_cost_hype * _hype_price_usd
+        if _native_price_usd is not None:
+            gas_cost_usd = gas_cost_eth * _native_price_usd
             if gas_cost_usd > MAX_TX_FEE_USD:
                 logger.warning(
                     f"Tx fee ${gas_cost_usd:.4f} exceeds ${MAX_TX_FEE_USD:.2f}, raising TxFeeExceeded"
@@ -85,7 +85,7 @@ def get_current_price(w3: Web3, pool_contract) -> Tuple[float, int, int]:
     sqrt_price_x96 = slot0[0]
     current_tick = slot0[1]
 
-    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.WETH_ADDRESS)
     invert = not token0_is_hype
     price = get_price_from_sqrt_price(sqrt_price_x96, dec0, dec1, invert)
 
@@ -168,13 +168,13 @@ def get_unclaimed_fees(w3: Web3, pool, pos: dict) -> tuple:
 
 @with_retry(max_retries=3, base_delay=2)
 def get_token_balances(w3: Web3) -> Tuple[int, int]:
-    from src.provider import get_hype_contract, get_usdc_contract
-    hype = get_hype_contract(w3)
+    from src.provider import get_weth_contract, get_usdc_contract
+    weth = get_weth_contract(w3)
     usdc = get_usdc_contract(w3)
     address = Web3.to_checksum_address(config.WALLET_ADDRESS)
-    hype_bal = hype.functions.balanceOf(address).call()
+    weth_bal = weth.functions.balanceOf(address).call()
     usdc_bal = usdc.functions.balanceOf(address).call()
-    return hype_bal, usdc_bal
+    return weth_bal, usdc_bal
 
 
 @with_retry(max_retries=3, base_delay=2)
@@ -342,10 +342,10 @@ def add_to_position(
     pos: dict,
     dry_run: bool = False,
 ) -> bool:
-    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.WETH_ADDRESS)
 
     hype_bal, usdc_bal = get_token_balances(w3)
-    wallet_val = (hype_bal / 10**config.HYPE_DECIMALS) * current_price + (usdc_bal / 10**config.USDC_DECIMALS)
+    wallet_val = (hype_bal / 10**config.NATIVE_DECIMALS) * current_price + (usdc_bal / 10**config.USDC_DECIMALS)
     if wallet_val < 0.2:
         logger.info(f"Wallet ${wallet_val:.2f} < $0.2, skipping add-to-position")
         return True
@@ -379,9 +379,9 @@ def add_to_position(
         return True
 
     logger.info(f"Adding liquidity: {add0} t0, {add1} t1")
-    approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+    approve_token(w3, get_native_or_usdc(w3, token0_is_hype),
                   config.POSITION_MANAGER_ADDRESS, add0, dry_run)
-    approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+    approve_token(w3, get_native_or_usdc(w3, not token0_is_hype),
                   config.POSITION_MANAGER_ADDRESS, add1, dry_run)
     return increase_liquidity(w3, position_manager, token_id, add0, add1, dry_run)
 
@@ -394,7 +394,7 @@ def rebalance(
     current_price: float,
     dry_run: bool = False,
 ) -> Optional[int]:
-    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.WETH_ADDRESS)
     tick_spacing = get_tick_spacing(pool_contract)
     invert = not token0_is_hype
 
@@ -411,6 +411,9 @@ def rebalance(
     )
 
     if pos["liquidity"] > 0:
+        logger.info("Step 0: Unstaking position from gauge...")
+        unstake_position(w3, token_id, dry_run)
+
         logger.info("Step 1: Collecting fees...")
         collect_fees(w3, position_manager, token_id, dry_run)
 
@@ -437,7 +440,7 @@ def rebalance(
 
     hype_bal, usdc_bal = get_token_balances(w3)
     logger.info(
-        f"Wallet: HYPE={hype_bal / 10**config.HYPE_DECIMALS:.4f}, "
+        f"Wallet: WETH={hype_bal / 10**config.NATIVE_DECIMALS:.4f}, "
         f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
     )
 
@@ -475,16 +478,16 @@ def rebalance(
         return token_id
 
     logger.info("Step 7: Approving tokens...")
-    hype_con = get_hype_or_usdc(w3, True)
-    usdc_con = get_hype_or_usdc(w3, False)
+    native_con = get_native_or_usdc(w3, True)
+    usdc_con = get_native_or_usdc(w3, False)
     pm_addr = config.POSITION_MANAGER_ADDRESS
 
     if token0_is_hype:
-        approve_token(w3, hype_con, pm_addr, amount0_desired, dry_run)
+        approve_token(w3, native_con, pm_addr, amount0_desired, dry_run)
         approve_token(w3, usdc_con, pm_addr, amount1_desired, dry_run)
     else:
         approve_token(w3, usdc_con, pm_addr, amount0_desired, dry_run)
-        approve_token(w3, hype_con, pm_addr, amount1_desired, dry_run)
+        approve_token(w3, native_con, pm_addr, amount1_desired, dry_run)
 
     logger.info(f"Step 8: Minting new position (fee tier: {pool_fee})...")
     new_token_id = mint_position(
@@ -499,6 +502,10 @@ def rebalance(
 
     result = new_token_id or token_id
 
+    # Stake the new position in the gauge
+    if new_token_id is not None:
+        stake_position(w3, result, dry_run)
+
     # Post-mint: swap leftover and add to position via increase_liquidity
     try:
         slot0 = pool_contract.functions.slot0().call()
@@ -506,8 +513,8 @@ def rebalance(
         hype_bal, usdc_bal = get_token_balances(w3)
         raw_now0, raw_now1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
 
-        leftover0_usd = (raw_now0 / 10**config.HYPE_DECIMALS) * current_price if token0_is_hype else raw_now0 / 10**config.USDC_DECIMALS
-        leftover1_usd = (raw_now1 / 10**config.HYPE_DECIMALS) * current_price if not token0_is_hype else raw_now1 / 10**config.USDC_DECIMALS
+        leftover0_usd = (raw_now0 / 10**config.NATIVE_DECIMALS) * current_price if token0_is_hype else raw_now0 / 10**config.USDC_DECIMALS
+        leftover1_usd = (raw_now1 / 10**config.NATIVE_DECIMALS) * current_price if not token0_is_hype else raw_now1 / 10**config.USDC_DECIMALS
 
         if leftover0_usd < 2.0 and leftover1_usd < 2.0:
             logger.info(f"Unused ~${leftover0_usd + leftover1_usd:.2f} < $2, skipping top-up")
@@ -515,26 +522,26 @@ def rebalance(
             logger.info(f"Unused ~${max(leftover0_usd, leftover1_usd):.1f}, swapping leftover and adding to position {result}")
 
             if token0_is_hype:
-                token0_name, token1_name = "HYPE", "USDC"
+                token0_name, token1_name = "WETH", "USDC"
             else:
-                token0_name, token1_name = "USDC", "HYPE"
+                token0_name, token1_name = "USDC", "WETH"
 
             if leftover0_usd > leftover1_usd:
                 amount_in = int(raw_now0 * 0.92)
                 if amount_in >= 1000:
-                    t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-                    t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
+                    t_in = config.WETH_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+                    t_out = config.USDC_ADDRESS if token0_is_hype else config.WETH_ADDRESS
                     logger.info(f"Swapping ${leftover0_usd:.1f} excess {token0_name} -> {token1_name}")
-                    approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                    approve_token(w3, get_native_or_usdc(w3, token0_is_hype),
                                   config.SWAP_ROUTER_ADDRESS, amount_in, dry_run)
                     swap_exact_input_single(w3, t_in, t_out, pool_fee, amount_in, dry_run)
             else:
                 amount_in = int(raw_now1 * 0.92)
                 if amount_in >= 1000:
-                    t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-                    t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+                    t_in = config.USDC_ADDRESS if token0_is_hype else config.WETH_ADDRESS
+                    t_out = config.WETH_ADDRESS if token0_is_hype else config.USDC_ADDRESS
                     logger.info(f"Swapping ${leftover1_usd:.1f} excess {token1_name} -> {token0_name}")
-                    approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                    approve_token(w3, get_native_or_usdc(w3, not token0_is_hype),
                                   config.SWAP_ROUTER_ADDRESS, amount_in, dry_run)
                     swap_exact_input_single(w3, t_in, t_out, pool_fee, amount_in, dry_run)
 
@@ -544,9 +551,9 @@ def rebalance(
             add1 = max(1, add1)
             if add0 > 1 or add1 > 1:
                 logger.info(f"Adding liquidity: {add0} t0, {add1} t1")
-                approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+                approve_token(w3, get_native_or_usdc(w3, token0_is_hype),
                               config.POSITION_MANAGER_ADDRESS, add0, dry_run)
-                approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+                approve_token(w3, get_native_or_usdc(w3, not token0_is_hype),
                               config.POSITION_MANAGER_ADDRESS, add1, dry_run)
                 increase_liquidity(w3, position_manager, result, add0, add1, dry_run)
     except Exception as e:
@@ -563,7 +570,7 @@ def create_position(
     current_price: float,
     dry_run: bool = False,
 ) -> Optional[int]:
-    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.WETH_ADDRESS)
     tick_spacing = get_tick_spacing(pool_contract)
     invert = not token0_is_hype
 
@@ -584,7 +591,7 @@ def create_position(
 
     hype_bal, usdc_bal = get_token_balances(w3)
     logger.info(
-        f"Wallet: HYPE={hype_bal / 10**config.HYPE_DECIMALS:.4f}, "
+        f"Wallet: HYPE={hype_bal / 10**config.NATIVE_DECIMALS:.4f}, "
         f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
     )
 
@@ -619,8 +626,8 @@ def create_position(
     logger.info(f"Using raw wallet balances for mint: amount0={amount0_desired} t0, amount1={amount1_desired} t1, ticks=[{tick_lower},{tick_upper}]")
 
     logger.info("Step 3: Approving tokens...")
-    hype_con = get_hype_or_usdc(w3, True)
-    usdc_con = get_hype_or_usdc(w3, False)
+    hype_con = get_native_or_usdc(w3, True)
+    usdc_con = get_native_or_usdc(w3, False)
     pm_addr = config.POSITION_MANAGER_ADDRESS
 
     if token0_is_hype:
@@ -639,19 +646,20 @@ def create_position(
 
     if new_token_id:
         logger.info(f"=== Position created. Token ID: {new_token_id} ===")
+        stake_position(w3, new_token_id, dry_run)
     else:
         logger.warning("Position creation failed or could not determine tokenId")
 
     return new_token_id
 
 
-def wrap_hype(w3: Web3, amount: int, dry_run: bool = False) -> bool:
+def wrap_eth(w3: Web3, amount: int, dry_run: bool = False) -> bool:
     if amount <= 0:
         return True
-    from src.provider import get_whype_contract
-    whype = get_whype_contract(w3)
-    logger.info(f"Wrapping {amount / 1e18:.4f} HYPE to wHYPE")
-    tx = whype.functions.deposit().build_transaction({
+    from src.provider import get_wnative_contract
+    weth_con = get_wnative_contract(w3)
+    logger.info(f"Wrapping {amount / 1e18:.4f} ETH to WETH")
+    tx = weth_con.functions.deposit().build_transaction({
         **build_tx_params(w3, 100_000),
         "value": amount,
     })
@@ -700,19 +708,19 @@ def balance_tokens(
     account = get_account(w3)
     native_balance = w3.eth.get_balance(account.address)
 
-    gas_reserve_wei = int(GAS_RESERVE_HYPE * 1e18)
+    gas_reserve_wei = int(GAS_RESERVE_ETH * 1e18)
     wrap_amount = native_balance - gas_reserve_wei
     if wrap_amount > 0:
-        wrap_hype(w3, wrap_amount, dry_run)
+        wrap_eth(w3, wrap_amount, dry_run)
 
-    hype_bal, usdc_bal = get_token_balances(w3)
+    weth_bal, usdc_bal = get_token_balances(w3)
     logger.info(
-        f"Balances: wHYPE={hype_bal / 10**config.HYPE_DECIMALS:.4f}, "
+        f"Balances: WETH={weth_bal / 10**config.NATIVE_DECIMALS:.4f}, "
         f"USDC={usdc_bal / 10**config.USDC_DECIMALS:.6f}"
     )
 
-    if hype_bal == 0 and usdc_bal == 0:
-        logger.warning("No wHYPE or USDC available after wrapping")
+    if weth_bal == 0 and usdc_bal == 0:
+        logger.warning("No WETH or USDC available after wrapping")
 
 
 def _optimize_ratio(
@@ -754,9 +762,9 @@ def _optimize_ratio(
         swap_raw = int(numerator / denominator * 0.99)
         if swap_raw >= 1000:
             logger.info(f"One-shot swap: token1->token0 (deviation={deviation:.4f})")
-            t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-            t_out = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-            approve_token(w3, get_hype_or_usdc(w3, not token0_is_hype),
+            t_in = config.USDC_ADDRESS if token0_is_hype else config.WETH_ADDRESS
+            t_out = config.WETH_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+            approve_token(w3, get_native_or_usdc(w3, not token0_is_hype),
                           config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
             swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
     else:
@@ -765,9 +773,9 @@ def _optimize_ratio(
         swap_raw = int(numerator / denominator * 0.99)
         if swap_raw >= 1000:
             logger.info(f"One-shot swap: token0->token1 (deviation={deviation:.4f})")
-            t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
-            t_out = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
-            approve_token(w3, get_hype_or_usdc(w3, token0_is_hype),
+            t_in = config.WETH_ADDRESS if token0_is_hype else config.USDC_ADDRESS
+            t_out = config.USDC_ADDRESS if token0_is_hype else config.WETH_ADDRESS
+            approve_token(w3, get_native_or_usdc(w3, token0_is_hype),
                           config.SWAP_ROUTER_ADDRESS, swap_raw, dry_run)
             swap_exact_input_single(w3, t_in, t_out, pool_fee, swap_raw, dry_run)
 
@@ -776,6 +784,36 @@ def _optimize_ratio(
     return new_raw0, new_raw1
 
 
-def get_hype_or_usdc(w3: Web3, is_hype: bool):
-    from src.provider import get_hype_contract, get_usdc_contract
-    return get_hype_contract(w3) if is_hype else get_usdc_contract(w3)
+@with_retry(max_retries=3, base_delay=2)
+def stake_position(w3: Web3, token_id: int, dry_run: bool = False) -> bool:
+    if not config.GAUGE_ADDRESS:
+        logger.warning("No GAUGE_ADDRESS configured, skipping stake")
+        return True
+    from src.provider import get_gauge_contract
+    gauge = get_gauge_contract(w3)
+    logger.info(f"Staking position {token_id} in gauge")
+    tx = gauge.functions.deposit(token_id).build_transaction(
+        build_tx_params(w3, 200_000)
+    )
+    receipt = send_transaction(w3, tx, dry_run)
+    return receipt is not None and receipt["status"] == 1
+
+
+@with_retry(max_retries=3, base_delay=2)
+def unstake_position(w3: Web3, token_id: int, dry_run: bool = False) -> bool:
+    if not config.GAUGE_ADDRESS:
+        logger.warning("No GAUGE_ADDRESS configured, skipping unstake")
+        return True
+    from src.provider import get_gauge_contract
+    gauge = get_gauge_contract(w3)
+    logger.info(f"Unstaking position {token_id} from gauge")
+    tx = gauge.functions.withdraw(token_id).build_transaction(
+        build_tx_params(w3, 200_000)
+    )
+    receipt = send_transaction(w3, tx, dry_run)
+    return receipt is not None and receipt["status"] == 1
+
+
+def get_native_or_usdc(w3: Web3, is_native: bool):
+    from src.provider import get_weth_contract, get_usdc_contract
+    return get_weth_contract(w3) if is_native else get_usdc_contract(w3)

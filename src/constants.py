@@ -1,6 +1,7 @@
 Q96 = 2 ** 96
 
 TICK_SPACINGS = {
+    50: 10,
     100: 1,
     500: 10,
     3000: 60,
@@ -127,7 +128,7 @@ ERC20_ABI = [
     },
 ]
 
-WHYPE_ABI = [
+WETH_ABI = [
     {
         "inputs": [],
         "name": "deposit",
@@ -167,6 +168,60 @@ SWAP_ROUTER_ABI = [
         "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
         "stateMutability": "payable",
         "type": "function",
+    },
+]
+
+GAUGE_ABI = [
+    {
+        "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+        "name": "deposit",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+        "name": "withdraw",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "owner", "type": "address"},
+            {"internalType": "uint256", "name": "index", "type": "uint256"},
+        ],
+        "name": "tokenOfOwnerByIndex",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "address", "name": "user", "type": "address"},
+            {"indexed": True, "internalType": "uint256", "name": "tokenId", "type": "uint256"},
+            {"indexed": True, "internalType": "uint128", "name": "liquidityToStake", "type": "uint128"},
+        ],
+        "name": "Deposit",
+        "type": "event",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "address", "name": "user", "type": "address"},
+            {"indexed": True, "internalType": "uint256", "name": "tokenId", "type": "uint256"},
+            {"indexed": True, "internalType": "uint128", "name": "liquidityToStake", "type": "uint128"},
+        ],
+        "name": "Withdraw",
+        "type": "event",
     },
 ]
 
