@@ -1,4 +1,5 @@
 import logging
+from time import sleep
 from typing import Optional, Tuple
 
 from web3 import Web3
@@ -287,6 +288,7 @@ def increase_liquidity(
     if amount0_desired == 0 and amount1_desired == 0:
         return True
 
+    sleep(2)
     deadline = build_deadline(w3)
     amount0_min = 0
     amount1_min = 0
@@ -336,7 +338,7 @@ def add_to_position(
     else:
         raw0, raw1 = usdc_bal, hype_bal
 
-    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
@@ -428,7 +430,7 @@ def rebalance(
     pool_fee = pool_contract.functions.fee().call()
 
     logger.info("Step 5b: Optimizing token ratio...")
-    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)
 
     logger.info("Step 6: Reading current balances and price for mint...")
     slot0 = pool_contract.functions.slot0().call()
@@ -576,7 +578,7 @@ def create_position(
     pool_fee = pool_contract.functions.fee().call()
 
     logger.info("Step 1b: Optimizing token ratio...")
-    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run)
+    raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)
 
     logger.info("Step 2: Reading current balances and price for mint...")
     slot0 = pool_contract.functions.slot0().call()
@@ -698,6 +700,7 @@ def _optimize_ratio(
     raw0: int,
     raw1: int,
     dry_run: bool = False,
+    pool_fee: int = 0,
 ) -> Tuple[int, int]:
     import math
     Q96 = 2 ** 96
@@ -717,7 +720,8 @@ def _optimize_ratio(
         logger.info(f"Ratio deviation {deviation:.4f} < 1%, no swap needed")
         return raw0, raw1
 
-    pool_fee = pool_contract.functions.fee().call()
+    if pool_fee == 0:
+        pool_fee = pool_contract.functions.fee().call()
 
     if current_ratio > target_ratio:
         numerator = raw1 - int(target_ratio * raw0)

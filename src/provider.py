@@ -1,4 +1,5 @@
 import logging
+import random
 from functools import wraps
 from typing import Any, Callable
 from time import sleep
@@ -12,6 +13,9 @@ from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI, WHYPE_ABI, 
 
 logger = logging.getLogger("liqbot")
 
+RATE_LIMIT_CODE = -32005
+RATE_LIMIT_WAIT = 60
+
 
 def with_retry(max_retries: int = 5, base_delay: int = 1):
     def decorator(func: Callable) -> Callable:
@@ -24,8 +28,13 @@ def with_retry(max_retries: int = 5, base_delay: int = 1):
                 except (Web3Exception, ConnectionError, TimeoutError) as e:
                     last_exc = e
                     if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"RPC error: {e}. Retry {attempt + 1}/{max_retries} in {delay}s")
+                        err_msg = str(e)
+                        is_rate_limit = "'code': -32005" in err_msg or "rate limit" in err_msg.lower()
+                        if is_rate_limit:
+                            delay = RATE_LIMIT_WAIT + random.uniform(0, 5)
+                        else:
+                            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(f"RPC error: {e}. Retry {attempt + 1}/{max_retries} in {delay:.0f}s")
                         sleep(delay)
                     else:
                         logger.error(f"RPC error after {max_retries} retries: {e}")

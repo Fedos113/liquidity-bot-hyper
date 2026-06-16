@@ -45,9 +45,25 @@ def signal_handler(sig, frame):
 def _secondary_cycle():
     global running, tx_lock, token_id_ref
 
+    logger.info(f"[SECONDARY] Initial delay {config.SECONDARY_CYCLE_INTERVAL}s before first cycle")
+    for _ in range(config.SECONDARY_CYCLE_INTERVAL):
+        if not running:
+            return
+        sleep(1)
+
     while running:
         cycle_start = time()
         logger.info("[SECONDARY] Cycle start")
+
+        if tx_lock.locked():
+            logger.info("[SECONDARY] Main cycle active, skipping RPC reads")
+            elapsed = time() - cycle_start
+            remaining = config.SECONDARY_CYCLE_INTERVAL - elapsed
+            for _ in range(int(max(remaining, 0))):
+                if not running:
+                    break
+                sleep(1)
+            continue
 
         try:
             w3 = get_web3()
