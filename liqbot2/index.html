@@ -86,6 +86,28 @@ body {
   margin-top: 24px;
 }
 
+.chart-card .card-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.chart-controls { display: flex; gap: 4px; }
+.chart-btn {
+  background: #21262d;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .15s;
+}
+.chart-btn:hover { background: #30363d; color: #c9d1d9; }
+.chart-btn.active { background: #1f6feb; border-color: #388bfd; color: #fff; }
+.chart-wrapper { position: relative; height: 280px; }
+
 @media (max-width: 600px) {
   .grid { grid-template-columns: 1fr; }
   .header { flex-direction: column; gap: 12px; align-items: stretch; text-align: center; }
@@ -125,19 +147,27 @@ body {
         <div class="stat"><span class="label">All</span><span class="value" id="pnlAll">—</span></div>
       </div>
     </div>
-    <div class="card">
-      <div class="label">Impermanent Loss</div>
-      <div class="value" id="il">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Total Tx Fees</div>
-      <div class="value" id="fees">—</div>
+
+    <div class="card full chart-card">
+      <div class="card-header-row">
+        <div class="label">PnL Chart</div>
+        <div class="chart-controls">
+          <button class="chart-btn active" data-period="24h">24h</button>
+          <button class="chart-btn" data-period="7d">7d</button>
+          <button class="chart-btn" data-period="all">All</button>
+        </div>
+      </div>
+      <div class="chart-wrapper">
+        <canvas id="pnlChart" height="280"></canvas>
+      </div>
     </div>
   </div>
 
   <div class="footer">liqbot2 &middot; manual refresh only</div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <script>
 function fmtAddr(a) { return a ? a.slice(0,6)+'...'+a.slice(-4) : '—'; }
 function fmtUsd(v) { return v != null ? '$'+Number(v).toLocaleString('en',{minimumFractionDigits:2}) : '—'; }
@@ -147,12 +177,61 @@ function fmtPnl(v) {
   const sign = v > 0 ? '+' : '';
   return `<span class="${cls}">${sign}$${Number(v).toLocaleString('en',{minimumFractionDigits:2})}</span>`;
 }
-function fmtIl(v) {
-  if (v == null) return '—';
-  if (v === 0) return '<span class="neutral">$0.00</span>';
-  const cls = v < 0 ? 'red' : 'green';
-  const sign = v < 0 ? '-$' : '+$';
-  return `<span class="${cls}">${sign}${Math.abs(v).toLocaleString('en',{minimumFractionDigits:2})}</span>`;
+let pnlChart = null;
+
+async function loadChart(period) {
+  try {
+    const res = await fetch(`/chart?period=${period}`);
+    const data = await res.json();
+
+    if (!data.labels || data.labels.length < 2) return;
+
+    const labels = data.labels.map(ts => new Date(ts * 1000));
+    const values = data.pnl;
+    const lastVal = values[values.length - 1];
+    const lineColor = lastVal >= 0 ? '#3fb950' : '#f85149';
+    const fillColor = lastVal >= 0 ? 'rgba(63,185,80,0.12)' : 'rgba(248,81,73,0.12)';
+
+    if (pnlChart) pnlChart.destroy();
+
+    const ctx = document.getElementById('pnlChart').getContext('2d');
+    pnlChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'PnL',
+          data: values,
+          borderColor: lineColor,
+          backgroundColor: fillColor,
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+          borderWidth: 2,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => '$' + ctx.parsed.y.toFixed(2) } } },
+        scales: {
+          x: {
+            type: 'time',
+            time: { tooltipFormat: 'MMM dd, HH:mm', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'MMM dd' } },
+            grid: { display: false },
+            ticks: { color: '#8b949e', maxTicksLimit: 8 },
+          },
+          y: {
+            grid: { color: '#21262d' },
+            ticks: { color: '#8b949e', callback: v => '$' + v.toLocaleString() }
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.error('Chart load failed:', e);
+  }
 }
 
 async function refresh() {
@@ -172,8 +251,6 @@ async function refresh() {
     document.getElementById('pnl24h').innerHTML = fmtPnl(d.pnl['24h']);
     document.getElementById('pnl7d').innerHTML = fmtPnl(d.pnl['7d']);
     document.getElementById('pnlAll').innerHTML = fmtPnl(d.pnl.all);
-    document.getElementById('il').innerHTML = fmtIl(d.il);
-    document.getElementById('fees').textContent = fmtUsd(d.total_fees_usd);
   } catch (e) {
     alert('Refresh failed: '+e.message);
   }
@@ -183,6 +260,17 @@ async function refresh() {
 }
 
 refresh();
+loadChart('24h');
+setInterval(refresh, 3600000);
+setInterval(() => { const a = document.querySelector('.chart-btn.active'); if (a) loadChart(a.dataset.period); }, 3600000);
+
+document.querySelectorAll('.chart-btn').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.chart-btn').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+    loadChart(this.dataset.period);
+  });
+});
 </script>
 </body>
 </html>
