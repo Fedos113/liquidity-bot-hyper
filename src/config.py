@@ -27,6 +27,7 @@ class Config:
 
     SECONDARY_CYCLE_INTERVAL: int = int(os.getenv("SECONDARY_CYCLE_INTERVAL", "600"))
     HYPE_DROP_THRESHOLD: float = float(os.getenv("HYPE_DROP_THRESHOLD", "0.98"))
+    HYPE_UPPER_THRESHOLD: float = float(os.getenv("HYPE_UPPER_THRESHOLD", "1.02"))
 
     HYPE_DECIMALS: int = int(os.getenv("HYPE_DECIMALS", "18"))
     USDC_DECIMALS: int = int(os.getenv("USDC_DECIMALS", "6"))
