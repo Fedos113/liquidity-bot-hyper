@@ -44,6 +44,21 @@ def main():
     logger = logging.getLogger("liqbot")
     logger.info("=== HYPE/USDC Liquidity Bot ===")
 
+    from src.provider import rpc_manager
+
+    logger.info("Checking RPC provider health...")
+    rpc_manager.test_all()
+    summary = rpc_manager.get_summary()
+    active_count = sum(1 for s in summary if s["active"])
+    logger.info(f"RPC providers: {active_count}/{len(summary)} active")
+    for s in summary:
+        status = "active" if s["active"] else "inactive"
+        conn = "connected" if s["connected"] else "disconnected"
+        logger.info(f"  {s['name']}: {status}, {conn}")
+    if active_count == 0:
+        logger.error("No active RPC providers. Exiting.")
+        sys.exit(1)
+
     try:
         from src.bot import run_bot
         run_bot()
