@@ -139,6 +139,7 @@ The bot auto-detects which keys are provided and builds a rotation chain: **Hype
 | `FEE_TIER` | `500` | Pool fee tier (500 = 0.05%) |
 | `FEE_COMPOUND_THRESHOLD_USD` | `5.0` | Auto-compound if fees exceed this |
 | `MIN_WALLET_USD` | `0.2` | Minimum wallet value to add funds |
+| `UNTOUCHABLE_HYPE` | `0.02` | Native HYPE reserved for gas fees |
 
 #### Secondary Cycle (Price Watcher)
 

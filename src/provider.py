@@ -120,6 +120,15 @@ class RPCManager:
                         return p.web3
         return self.get_web3()
 
+    def get_web3_for_name(self, keyword: str) -> Web3:
+        for p in self.providers:
+            if keyword.lower() in p.name.lower() and p.active:
+                if not p.web3:
+                    p.connect()
+                if p.web3:
+                    return p.web3
+        return self.get_web3()
+
     def on_error(self, failed_w3: Web3) -> Web3:
         active = self.get_active()
         for i, p in enumerate(active):

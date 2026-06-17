@@ -6,14 +6,13 @@ from web3 import Web3
 from web3.types import TxReceipt
 
 from src.config import config
-from src.provider import with_retry, get_account
+from src.provider import with_retry, get_account, rpc_manager
 from src.math_utils import get_tick_spacing, get_token_order, calculate_bounds, get_price_from_sqrt_price
 
 logger = logging.getLogger("liqbot")
 
 _hype_price_usd: Optional[float] = None
 MAX_TX_FEE_USD = 0.05
-GAS_RESERVE_HYPE = 0.02
 
 
 class TxFeeExceeded(Exception):
@@ -628,18 +627,19 @@ def create_position(
     logger.info("Step 1b: Optimizing token ratio...")
     raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)
 
-    logger.info("Step 2: Reading current balances and price for mint...")
+    logger.info("Step 2: Computing optimal mint amounts...")
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
-    hype_bal, usdc_bal = get_token_balances(w3)
+    from src.math_utils import calculate_token_amounts
+    amount0_optimal, amount1_optimal = calculate_token_amounts(raw0, raw1, sqrt_price_x96, tick_lower, tick_upper)
     if token0_is_hype:
-        amount0_desired, amount1_desired = hype_bal, usdc_bal
+        amount0_desired, amount1_desired = amount0_optimal, amount1_optimal
     else:
-        amount0_desired, amount1_desired = usdc_bal, hype_bal
+        amount0_desired, amount1_desired = amount1_optimal, amount0_optimal
 
     tick_lower = round(tick_lower / tick_spacing) * tick_spacing
     tick_upper = round(tick_upper / tick_spacing) * tick_spacing
-    logger.info(f"Using raw wallet balances for mint: amount0={amount0_desired} t0, amount1={amount1_desired} t1, ticks=[{tick_lower},{tick_upper}]")
+    logger.info(f"Mint amounts: {amount0_desired} t0, {amount1_desired} t1")
 
     logger.info("Step 3: Approving tokens...")
     hype_con = get_hype_or_usdc(w3, True)
@@ -662,6 +662,33 @@ def create_position(
 
     if new_token_id:
         logger.info(f"=== Position created. Token ID: {new_token_id} ===")
+        try:
+            hype_bal, usdc_bal = get_token_balances(w3)
+            leftover_raw0, leftover_raw1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+            leftover_usd = (
+                (leftover_raw0 / 10 ** config.HYPE_DECIMALS) * current_price if token0_is_hype else leftover_raw0 / 10 ** config.USDC_DECIMALS
+            ) + (
+                (leftover_raw1 / 10 ** config.HYPE_DECIMALS) * current_price if not token0_is_hype else leftover_raw1 / 10 ** config.USDC_DECIMALS
+            )
+            if leftover_usd > 2.0 and leftover_raw0 > 0 and leftover_raw1 > 0:
+                logger.info(f"Top-up: ${leftover_usd:.2f} leftover, optimizing...")
+                w3_evm = rpc_manager.get_web3_for_name("HyperEVM")
+                w3_hype = rpc_manager.get_web3_for_name("HypeRPC")
+                w3_chain = rpc_manager.get_web3_for_name("Chainstack")
+                slot0 = pool_contract.functions.slot0().call()
+                sqrt_price_x96 = slot0[0]
+                _optimize_ratio(w3_evm, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, leftover_raw0, leftover_raw1, dry_run, pool_fee)
+                hype_bal, usdc_bal = get_token_balances(w3_evm)
+                add0, add1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
+                add0, add1 = max(1, add0), max(1, add1)
+                if add0 > 1 or add1 > 1:
+                    sleep(config.TX_INTER_SLEEP)
+                    approve_token(w3_hype, get_hype_or_usdc(w3_hype, token0_is_hype), config.POSITION_MANAGER_ADDRESS, add0, dry_run)
+                    approve_token(w3_hype, get_hype_or_usdc(w3_hype, not token0_is_hype), config.POSITION_MANAGER_ADDRESS, add1, dry_run)
+                    sleep(config.TX_INTER_SLEEP)
+                    increase_liquidity(w3_chain, position_manager, new_token_id, add0, add1, dry_run)
+        except Exception as e:
+            logger.warning(f"Top-up failed (non-critical): {e}")
     else:
         logger.warning("Position creation failed or could not determine tokenId")
 
@@ -723,7 +750,7 @@ def balance_tokens(
     account = get_account(w3)
     native_balance = w3.eth.get_balance(account.address)
 
-    gas_reserve_wei = int(GAS_RESERVE_HYPE * 1e18)
+    gas_reserve_wei = int(config.UNTOUCHABLE_HYPE * 1e18)
     wrap_amount = native_balance - gas_reserve_wei
     if wrap_amount > 0:
         wrap_hype(w3, wrap_amount, dry_run)
@@ -774,7 +801,7 @@ def _optimize_ratio(
     if current_ratio > target_ratio:
         numerator = raw1 - int(target_ratio * raw0)
         denominator = 1.0 + target_ratio / p
-        swap_raw = int(numerator / denominator * 0.99)
+        swap_raw = int(numerator / denominator)
         if swap_raw >= 1000:
             logger.info(f"One-shot swap: token1->token0 (deviation={deviation:.4f})")
             t_in = config.USDC_ADDRESS if token0_is_hype else config.HYPE_ADDRESS
@@ -785,7 +812,7 @@ def _optimize_ratio(
     else:
         numerator = int(target_ratio * raw0) - raw1
         denominator = p + target_ratio
-        swap_raw = int(numerator / denominator * 0.99)
+        swap_raw = int(numerator / denominator)
         if swap_raw >= 1000:
             logger.info(f"One-shot swap: token0->token1 (deviation={deviation:.4f})")
             t_in = config.HYPE_ADDRESS if token0_is_hype else config.USDC_ADDRESS
