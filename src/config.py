@@ -31,6 +31,7 @@ class Config:
     FEE_TIER: int = int(os.getenv("FEE_TIER", "3000"))
     FEE_COMPOUND_THRESHOLD_USD: float = float(os.getenv("FEE_COMPOUND_THRESHOLD_USD", "5.0"))
     MIN_WALLET_USD: float = float(os.getenv("MIN_WALLET_USD", "0.2"))
+    UNTOUCHABLE_HYPE: float = float(os.getenv("UNTOUCHABLE_HYPE", "0.02"))
 
     # DEPRECATED: use SECONDARY_INNER instead
     DOWNWARD_CYCLE_INTERVAL: int = int(os.getenv("DOWNWARD_CYCLE_INTERVAL", "600"))
