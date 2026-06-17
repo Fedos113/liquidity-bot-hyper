@@ -39,6 +39,7 @@ tx_lock = threading.Lock()
 token_id_ref = [0]
 upper_threshold_event = threading.Event()
 downward_trigger_event = threading.Event()
+downward_inner_event = threading.Event()
 
 
 def signal_handler(sig, frame):
@@ -104,37 +105,10 @@ def _downward_cycle():
                 if current_price < trigger_price:
                     logger.warning(
                         f"[DOWNWARD] Price ${current_price:.4f} dropped >{((1 - config.HYPE_DROP_THRESHOLD) * 100):.0f}% "
-                        f"below lower bound ${lower_price:.4f}. Closing position..."
+                        f"below lower bound ${lower_price:.4f}. Triggering inner close cycle..."
                     )
-                    with tx_lock:
-                        set_hype_price(current_price)
-                        try:
-                            collect_fees(w3, pm, tid, config.DRY_RUN)
-                            remove_liquidity(w3, pm, tid, pos["liquidity"], config.DRY_RUN)
-                            collect_fees(w3, pm, tid, config.DRY_RUN)
-
-                            hype_bal, usdc_bal = get_token_balances(w3)
-                            if hype_bal > 0:
-                                pool_fee = pool.functions.fee().call()
-                                approve_token(
-                                    w3, get_hype_or_usdc(w3, True),
-                                    config.SWAP_ROUTER_ADDRESS, hype_bal, config.DRY_RUN,
-                                )
-                                swap_exact_input_single(
-                                    w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
-                                    pool_fee, hype_bal, config.DRY_RUN,
-                                )
-                                logger.info("[DOWNWARD] Position closed, all wHYPE swapped to USDC")
-                                downward_trigger_event.set()
-                        except TxFeeExceeded as e:
-                            logger.warning(f"[DOWNWARD] {e}, skipping to next cycle with 60s delay")
-                            elapsed = time() - cycle_start
-                            remaining = 60
-                            for _ in range(int(max(remaining, 0))):
-                                if not running:
-                                    break
-                                sleep(1)
-                            continue
+                    downward_inner_event.set()
+                    downward_trigger_event.set()
                 else:
                     logger.info("[DOWNWARD] Price above drop threshold, no action")
             else:
@@ -149,6 +123,79 @@ def _downward_cycle():
             if not running:
                 break
             sleep(1)
+
+
+def _downward_inner_cycle():
+    global running, tx_lock, token_id_ref
+
+    while running:
+        downward_inner_event.wait()
+        if not running:
+            return
+
+        logger.info("[DOWNWARD-INNER] Inner cycle triggered: closing position and swapping to USDC")
+
+        while running:
+            cycle_start = time()
+            success = False
+
+            try:
+                w3 = get_web3()
+                pool = get_pool_contract(w3)
+                pm = get_position_manager_contract(w3)
+                pool_t0 = pool.functions.token0().call()
+                pool_t1 = pool.functions.token1().call()
+
+                tid = token_id_ref[0]
+                pos = None
+                if tid > 0:
+                    pos = get_position_details(w3, pm, tid)
+                if not pos or pos["liquidity"] == 0:
+                    new_id, pos = _auto_discover_position(w3, pm, pool_t0, pool_t1)
+                    if new_id is not None:
+                        token_id_ref[0] = new_id
+                        tid = new_id
+
+                current_price, _, _ = get_current_price(w3, pool)
+                set_hype_price(current_price)
+
+                with tx_lock:
+                    if tid > 0 and pos and pos["liquidity"] > 0:
+                        collect_fees(w3, pm, tid, config.DRY_RUN)
+                        remove_liquidity(w3, pm, tid, pos["liquidity"], config.DRY_RUN)
+                        collect_fees(w3, pm, tid, config.DRY_RUN)
+
+                    hype_bal, usdc_bal = get_token_balances(w3)
+                    if hype_bal > 0:
+                        pool_fee = pool.functions.fee().call()
+                        approve_token(
+                            w3, get_hype_or_usdc(w3, True),
+                            config.SWAP_ROUTER_ADDRESS, hype_bal, config.DRY_RUN,
+                        )
+                        swap_exact_input_single(
+                            w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
+                            pool_fee, hype_bal, config.DRY_RUN,
+                        )
+                        logger.info("[DOWNWARD-INNER] All wHYPE swapped to USDC")
+
+                    success = True
+                    logger.info("[DOWNWARD-INNER] Position closed and swapped successfully")
+
+            except TxFeeExceeded as e:
+                logger.warning(f"[DOWNWARD-INNER] {e}, retrying in {config.DOWNWARD_INNER_CYCLE_INTERVAL}s")
+            except Exception as e:
+                logger.warning(f"[DOWNWARD-INNER] Error: {e}, retrying in {config.DOWNWARD_INNER_CYCLE_INTERVAL}s")
+
+            if success:
+                downward_inner_event.clear()
+                break
+
+            elapsed = time() - cycle_start
+            remaining = config.DOWNWARD_INNER_CYCLE_INTERVAL - elapsed
+            for _ in range(int(max(remaining, 0))):
+                if not running:
+                    break
+                sleep(1)
 
 
 def _upward_cycle():
@@ -247,7 +294,8 @@ def run_bot():
     )
     logger.info(
         f"Downward protection cycle: interval={config.DOWNWARD_CYCLE_INTERVAL}s, "
-        f"drop_threshold={config.HYPE_DROP_THRESHOLD}"
+        f"drop_threshold={config.HYPE_DROP_THRESHOLD}, "
+        f"inner_interval={config.DOWNWARD_INNER_CYCLE_INTERVAL}s"
     )
     logger.info(
         f"Upward surge cycle: interval={config.UPWARD_CYCLE_INTERVAL}s, "
@@ -256,8 +304,10 @@ def run_bot():
 
     token_id_ref[0] = token_id
     downward_thread = threading.Thread(target=_downward_cycle, daemon=True)
+    downward_inner_thread = threading.Thread(target=_downward_inner_cycle, daemon=True)
     upward_thread = threading.Thread(target=_upward_cycle, daemon=True)
     downward_thread.start()
+    downward_inner_thread.start()
     upward_thread.start()
 
     while running:
