@@ -28,6 +28,7 @@ class Config:
     DOWNWARD_CYCLE_INTERVAL: int = int(os.getenv("DOWNWARD_CYCLE_INTERVAL", "600"))
     UPWARD_CYCLE_INTERVAL: int = int(os.getenv("UPWARD_CYCLE_INTERVAL", "600"))
     HYPE_DROP_THRESHOLD: float = float(os.getenv("HYPE_DROP_THRESHOLD", "0.98"))
+    DOWNWARD_COOLDOWN: int = int(os.getenv("DOWNWARD_COOLDOWN", "3600"))
     HYPE_UPPER_THRESHOLD: float = float(os.getenv("HYPE_UPPER_THRESHOLD", "1.02"))
 
     HYPE_DECIMALS: int = int(os.getenv("HYPE_DECIMALS", "18"))
