@@ -116,7 +116,7 @@ def get_position_details(w3: Web3, position_manager, token_id: int) -> Optional[
 
 
 @with_retry(max_retries=3, base_delay=2)
-def get_unclaimed_fees(w3: Web3, pool, pos: dict) -> tuple:
+def get_unclaimed_fees(w3: Web3, pool, pos: dict, cached_slot0=None) -> tuple:
     tick_lower = pos["tickLower"]
     tick_upper = pos["tickUpper"]
     liquidity = pos["liquidity"]
@@ -131,8 +131,11 @@ def get_unclaimed_fees(w3: Web3, pool, pos: dict) -> tuple:
     fee_growth_global_0 = pool.functions.feeGrowthGlobal0X128().call()
     fee_growth_global_1 = pool.functions.feeGrowthGlobal1X128().call()
 
-    slot0 = pool.functions.slot0().call()
-    current_tick = slot0[1]
+    if cached_slot0 is not None:
+        current_tick = cached_slot0[1]
+    else:
+        slot0 = pool.functions.slot0().call()
+        current_tick = slot0[1]
 
     lower_tick = pool.functions.ticks(tick_lower).call()
     upper_tick = pool.functions.ticks(tick_upper).call()
@@ -259,12 +262,18 @@ def mint_position(
     amount1_desired: int,
     fee_tier: int,
     dry_run: bool = False,
+    token0: Optional[str] = None,
+    token1: Optional[str] = None,
 ) -> Optional[int]:
     account = get_account(w3)
     deadline = build_deadline(w3)
 
-    token0_addr = pool_contract.functions.token0().call()
-    token1_addr = pool_contract.functions.token1().call()
+    if token0 is None or token1 is None:
+        token0_addr = pool_contract.functions.token0().call()
+        token1_addr = pool_contract.functions.token1().call()
+    else:
+        token0_addr = token0
+        token1_addr = token1
 
     logger.info(
         f"Minting position: tickLower={tick_lower}, tickUpper={tick_upper}, "
@@ -341,20 +350,22 @@ def add_to_position(
     current_price: float,
     pos: dict,
     dry_run: bool = False,
+    pool_fee: int = 0,
 ) -> bool:
     token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
 
     hype_bal, usdc_bal = get_token_balances(w3)
     wallet_val = (hype_bal / 10**config.HYPE_DECIMALS) * current_price + (usdc_bal / 10**config.USDC_DECIMALS)
-    if wallet_val < 0.2:
-        logger.info(f"Wallet ${wallet_val:.2f} < $0.2, skipping add-to-position")
+    if wallet_val < config.MIN_WALLET_USD:
+        logger.info(f"Wallet ${wallet_val:.2f} < ${config.MIN_WALLET_USD}, skipping add-to-position")
         return True
 
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
     tick_lower = pos["tickLower"]
     tick_upper = pos["tickUpper"]
-    pool_fee = pool_contract.functions.fee().call()
+    if pool_fee == 0:
+        pool_fee = pool_contract.functions.fee().call()
 
     logger.info(f"Adding funds to position {token_id} [{tick_lower}, {tick_upper}]")
 
@@ -393,6 +404,7 @@ def rebalance(
     token_id: int,
     current_price: float,
     dry_run: bool = False,
+    pool_fee: int = 0,
 ) -> Optional[int]:
     token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
     tick_spacing = get_tick_spacing(pool_contract)
@@ -452,7 +464,8 @@ def rebalance(
         logger.warning("No tokens available to mint new position")
         return None
 
-    pool_fee = pool_contract.functions.fee().call()
+    if pool_fee == 0:
+        pool_fee = pool_contract.functions.fee().call()
 
     logger.info("Step 5b: Optimizing token ratio...")
     raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)
@@ -491,6 +504,7 @@ def rebalance(
         w3, position_manager, pool_contract,
         tick_lower, tick_upper, amount0_desired, amount1_desired,
         pool_fee, dry_run,
+        token0=token0, token1=token1,
     )
 
     if new_token_id is None and not dry_run:
@@ -562,8 +576,16 @@ def create_position(
     pool_contract,
     current_price: float,
     dry_run: bool = False,
+    pool_fee: int = 0,
+    token0: Optional[str] = None,
+    token1: Optional[str] = None,
+    token0_is_hype: Optional[bool] = None,
 ) -> Optional[int]:
-    token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    if token0_is_hype is None:
+        token0_is_hype, dec0, dec1 = get_token_order(pool_contract, config.HYPE_ADDRESS)
+    else:
+        dec0 = config.HYPE_DECIMALS if token0_is_hype else config.USDC_DECIMALS
+        dec1 = config.HYPE_DECIMALS if not token0_is_hype else config.USDC_DECIMALS
     tick_spacing = get_tick_spacing(pool_contract)
     invert = not token0_is_hype
 
@@ -600,7 +622,8 @@ def create_position(
         logger.warning("No tokens available to create position")
         return None
 
-    pool_fee = pool_contract.functions.fee().call()
+    if pool_fee == 0:
+        pool_fee = pool_contract.functions.fee().call()
 
     logger.info("Step 1b: Optimizing token ratio...")
     raw0, raw1 = _optimize_ratio(w3, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, raw0, raw1, dry_run, pool_fee)

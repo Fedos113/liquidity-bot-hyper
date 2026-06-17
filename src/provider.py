@@ -1,7 +1,7 @@
 import logging
 import random
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from time import sleep
 
 from web3 import Web3
@@ -16,6 +16,168 @@ logger = logging.getLogger("liqbot")
 RATE_LIMIT_CODE = -32005
 RATE_LIMIT_WAIT = 60
 
+MULTICALL3_ADDRESS = "0x0000000000000000000000000000000000000999"
+MULTICALL3_ABI = [
+    {
+        "inputs": [{"components": [{"name": "target", "type": "address"}, {"name": "allowFailure", "type": "bool"}, {"name": "callData", "type": "bytes"}], "name": "calls", "type": "tuple[]"}],
+        "name": "aggregate3",
+        "outputs": [{"components": [{"name": "success", "type": "bool"}, {"name": "returnData", "type": "bytes"}], "name": "returnData", "type": "tuple[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+
+class RPCProvider:
+    def __init__(self, name: str, url: str):
+        self.name = name
+        self.url = url
+        self.active = True
+        self.web3: Optional[Web3] = None
+
+    def connect(self) -> bool:
+        try:
+            w3 = Web3(Web3.HTTPProvider(self.url, request_kwargs={"timeout": 30}))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            if w3.is_connected():
+                logger.info(f"Connected to {self.name}")
+                self.web3 = w3
+                return True
+            logger.warning(f"{self.name} endpoint not reachable")
+        except Exception as e:
+            logger.warning(f"{self.name} connection failed: {e}")
+        self.active = False
+        return False
+
+
+class RPCManager:
+    SLOT_ORDER = ["HypeRPC", "Chainstack", "Alchemy", "dRPC"]
+
+    def __init__(self):
+        self.providers: list[RPCProvider] = []
+        self._build_providers()
+
+    def _build_providers(self):
+        if config.HYPE_RPC_API_KEY:
+            self.providers.append(RPCProvider(
+                "HypeRPC",
+                f"https://rpc.hyperpc.app/evm?api_key={config.HYPE_RPC_API_KEY}",
+            ))
+        if config.CHAINSTACK_ENDPOINT:
+            self.providers.append(RPCProvider("Chainstack", config.CHAINSTACK_ENDPOINT))
+        if config.ALCHEMY_API_KEY:
+            self.providers.append(RPCProvider(
+                "Alchemy",
+                f"https://eth-hyperliquid-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
+            ))
+        if config.DRPC_API_KEY:
+            self.providers.append(RPCProvider(
+                "dRPC",
+                f"https://lb.drpc.org/ogrpc?network=hyperliquid&dkey={config.DRPC_API_KEY}",
+            ))
+        self.providers.append(RPCProvider("HyperEVM (fallback)", config.RPC_URL))
+
+    def get_active(self) -> list[RPCProvider]:
+        return [p for p in self.providers if p.active]
+
+    def get_active_names(self) -> list[str]:
+        return [p.name for p in self.get_active()]
+
+    def get_web3(self) -> Web3:
+        for p in self.get_active():
+            if p.web3:
+                return p.web3
+        for p in self.get_active():
+            if p.connect():
+                return p.web3
+        raise ConnectionError("No active RPC providers available")
+
+    def get_web3_for_slot(self, slot: int) -> Web3:
+        active = self.get_active()
+        if not active:
+            raise ConnectionError("No active RPC providers available")
+        if slot == 0:
+            idx = 0
+        elif slot == 1:
+            idx = min(1, len(active) - 1)
+        else:
+            idx = 0
+        p = active[idx]
+        if not p.web3:
+            p.connect()
+        if p.web3:
+            return p.web3
+        return self.get_web3()
+
+    def get_web3_for_swap(self) -> Web3:
+        priority = ["HypeRPC", "Chainstack", "Alchemy", "dRPC"]
+        for name in priority:
+            for p in self.providers:
+                if p.name == name and p.active:
+                    if not p.web3:
+                        p.connect()
+                    if p.web3:
+                        return p.web3
+        return self.get_web3()
+
+    def on_error(self, failed_w3: Web3) -> Web3:
+        active = self.get_active()
+        for i, p in enumerate(active):
+            if p.web3 is failed_w3:
+                next_idx = (i + 1) % len(active)
+                np = active[next_idx]
+                if not np.web3:
+                    np.connect()
+                if np.web3:
+                    logger.info(f"RPC switched: {p.name} -> {np.name}")
+                    return np.web3
+                return self.get_web3()
+        return self.get_web3()
+
+    def on_quota_exceeded(self, failed_w3: Web3):
+        for p in self.providers:
+            if p.web3 is failed_w3:
+                p.active = False
+                p.web3 = None
+                logger.warning(f"RPC provider {p.name} disabled (quota exceeded)")
+                break
+        return self.get_web3()
+
+    def test_all(self):
+        for p in self.providers:
+            if p.active:
+                ok = p.connect()
+                if not ok:
+                    logger.warning(f"RPC provider {p.name} marked inactive")
+            else:
+                logger.info(f"RPC provider {p.name} skipped (inactive)")
+
+    def get_summary(self) -> list[dict]:
+        return [
+            {"name": p.name, "active": p.active, "connected": p.web3 is not None}
+            for p in self.providers
+        ]
+
+
+rpc_manager = RPCManager()
+
+_mc3_available = None
+
+
+def get_multicall3(w3: Web3) -> Optional[Any]:
+    global _mc3_available
+    if _mc3_available is None:
+        try:
+            code = w3.eth.get_code(Web3.to_checksum_address(MULTICALL3_ADDRESS))
+            _mc3_available = code != b""
+        except Exception:
+            _mc3_available = False
+    if _mc3_available:
+        return w3.eth.contract(
+            address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI
+        )
+    return None
+
 
 def with_retry(max_retries: int = 5, base_delay: int = 1):
     def decorator(func: Callable) -> Callable:
@@ -29,7 +191,7 @@ def with_retry(max_retries: int = 5, base_delay: int = 1):
                     last_exc = e
                     if attempt < max_retries - 1:
                         err_msg = str(e)
-                        is_rate_limit = "'code': -32005" in err_msg or "rate limit" in err_msg.lower()
+                        is_rate_limit = "'code': -32005" in err_msg or "rate limit" in err_msg.lower() or "quota" in err_msg.lower() or "exceeded" in err_msg.lower()
                         if is_rate_limit:
                             delay = RATE_LIMIT_WAIT + random.uniform(0, 5)
                         else:
@@ -44,12 +206,7 @@ def with_retry(max_retries: int = 5, base_delay: int = 1):
 
 
 def get_web3() -> Web3:
-    w3 = Web3(Web3.HTTPProvider(config.RPC_URL, request_kwargs={"timeout": 30}))
-    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    if not w3.is_connected():
-        raise ConnectionError(f"Failed to connect to RPC: {config.RPC_URL}")
-    logger.info(f"Connected to HyperEVM. Chain ID: {w3.eth.chain_id}")
-    return w3
+    return rpc_manager.get_web3()
 
 
 def get_pool_contract(w3: Web3):
