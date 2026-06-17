@@ -38,6 +38,7 @@ running = True
 tx_lock = threading.Lock()
 token_id_ref = [0]
 upper_threshold_event = threading.Event()
+downward_trigger_event = threading.Event()
 
 
 def signal_handler(sig, frame):
@@ -124,6 +125,7 @@ def _downward_cycle():
                                     pool_fee, hype_bal, config.DRY_RUN,
                                 )
                                 logger.info("[DOWNWARD] Position closed, all wHYPE swapped to USDC")
+                                downward_trigger_event.set()
                         except TxFeeExceeded as e:
                             logger.warning(f"[DOWNWARD] {e}, skipping to next cycle with 60s delay")
                             elapsed = time() - cycle_start
@@ -264,6 +266,15 @@ def run_bot():
         cycle_start = time()
         logger.info("=" * 50)
         logger.info(f"Cycle start: {cycle_start}")
+
+        if downward_trigger_event.is_set():
+            logger.info("Downward trigger detected, sleeping 1h before next cycle...")
+            downward_trigger_event.clear()
+            for _ in range(config.DOWNWARD_COOLDOWN):
+                if not running:
+                    break
+                sleep(1)
+            continue
 
         try:
             w3 = get_web3()
