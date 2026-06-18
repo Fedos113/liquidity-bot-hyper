@@ -61,19 +61,19 @@ class RPCManager:
         if config.HYPE_RPC_API_KEY:
             self.providers.append(RPCProvider(
                 "HypeRPC",
-                f"https://rpc.hyperpc.app/evm?api_key={config.HYPE_RPC_API_KEY}",
+                f"https://evmrpc-eu.hyperpc.app/{config.HYPE_RPC_API_KEY}?apikey={config.HYPE_RPC_API_KEY}",
             ))
         if config.CHAINSTACK_ENDPOINT:
             self.providers.append(RPCProvider("Chainstack", config.CHAINSTACK_ENDPOINT))
         if config.ALCHEMY_API_KEY:
             self.providers.append(RPCProvider(
                 "Alchemy",
-                f"https://eth-hyperliquid-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
+                f"https://hyperliquid-mainnet.g.alchemy.com/v2/{config.ALCHEMY_API_KEY}",
             ))
         if config.DRPC_API_KEY:
             self.providers.append(RPCProvider(
                 "dRPC",
-                f"https://lb.drpc.org/ogrpc?network=hyperliquid&dkey={config.DRPC_API_KEY}",
+                f"https://lb.drpc.live/hyperliquid/{config.DRPC_API_KEY}",
             ))
         self.providers.append(RPCProvider("HyperEVM (fallback)", config.RPC_URL))
 
