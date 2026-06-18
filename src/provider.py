@@ -1,8 +1,6 @@
 import logging
-import random
 from functools import wraps
 from typing import Any, Callable, Optional
-from time import sleep
 
 from web3 import Web3
 from web3.exceptions import Web3Exception
@@ -13,9 +11,15 @@ from src.constants import POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI, WHYPE_ABI, 
 
 logger = logging.getLogger("liqbot")
 
-RATE_LIMIT_CODE = -32005
-RATE_LIMIT_WAIT = 60
 
+def sanitize_err(msg: str) -> str:
+    """Redact any configured RPC URL (which may contain API keys) from an error message."""
+    for p in rpc_manager.providers:
+        if p.url and p.url in msg:
+            msg = msg.replace(p.url, f"{p.name} [URL REDACTED]")
+    return msg
+
+PUBLIC_RPC_URL = "https://rpc.hyperliquid.xyz/evm"
 MULTICALL3_ADDRESS = "0x0000000000000000000000000000000000000999"
 MULTICALL3_ABI = [
     {
@@ -45,22 +49,24 @@ class RPCProvider:
                 return True
             logger.warning(f"{self.name} endpoint not reachable")
         except Exception as e:
-            logger.warning(f"{self.name} connection failed: {e}")
+            logger.warning(f"{self.name} connection failed: {sanitize_err(str(e))}")
         self.active = False
         return False
 
 
 class RPCManager:
-    SLOT_ORDER = ["HypeRPC", "Alchemy", "dRPC", "Chainstack"]
+    SLOT_ORDER = ["HypeRPC (public)", "HypeRPC (API)", "Alchemy", "dRPC", "Chainstack"]
 
     def __init__(self):
         self.providers: list[RPCProvider] = []
         self._build_providers()
 
     def _build_providers(self):
+        # Public HypeRPC (no API key) — always first in priority
+        self.providers.append(RPCProvider("HypeRPC (public)", PUBLIC_RPC_URL))
         if config.HYPE_RPC_API_KEY:
             self.providers.append(RPCProvider(
-                "HypeRPC",
+                "HypeRPC (API)",
                 f"https://evmrpc-eu.hyperpc.app/{config.HYPE_RPC_API_KEY}?apikey={config.HYPE_RPC_API_KEY}",
             ))
         if config.ALCHEMY_API_KEY:
@@ -75,7 +81,9 @@ class RPCManager:
             ))
         if config.CHAINSTACK_ENDPOINT:
             self.providers.append(RPCProvider("Chainstack", config.CHAINSTACK_ENDPOINT))
-        self.providers.append(RPCProvider("HyperEVM (fallback)", config.RPC_URL))
+        # Only add fallback if different from public endpoint
+        if config.RPC_URL.rstrip("/").lower() != PUBLIC_RPC_URL.rstrip("/").lower():
+            self.providers.append(RPCProvider("HyperEVM (fallback)", config.RPC_URL))
 
     def get_active(self) -> list[RPCProvider]:
         return [p for p in self.providers if p.active]
@@ -105,7 +113,7 @@ class RPCManager:
         return self.get_web3()
 
     def get_web3_for_swap(self) -> Web3:
-        priority = ["HypeRPC", "Alchemy", "dRPC", "Chainstack"]
+        priority = ["HypeRPC (public)", "HypeRPC (API)", "Alchemy", "dRPC", "Chainstack"]
         for name in priority:
             for p in self.providers:
                 if p.name == name and p.active:
@@ -125,27 +133,15 @@ class RPCManager:
         return self.get_web3()
 
     def on_error(self, failed_w3: Web3) -> Web3:
-        active = self.get_active()
-        for i, p in enumerate(active):
-            if p.web3 is failed_w3:
-                next_idx = (i + 1) % len(active)
-                np = active[next_idx]
-                if not np.web3:
-                    np.connect()
-                if np.web3:
-                    logger.info(f"RPC switched: {p.name} -> {np.name}")
-                    return np.web3
-                return self.get_web3()
-        return self.get_web3()
-
-    def on_quota_exceeded(self, failed_w3: Web3):
         for p in self.providers:
             if p.web3 is failed_w3:
                 p.active = False
                 p.web3 = None
-                logger.warning(f"RPC provider {p.name} disabled (quota exceeded)")
+                logger.warning(f"RPC provider {p.name} disabled (error)")
                 break
-        return self.get_web3()
+        next_w3 = self.get_web3()
+        logger.info(f"RPC switched to next active provider")
+        return next_w3
 
     def test_all(self):
         for p in self.providers:
@@ -183,7 +179,7 @@ def get_multicall3(w3: Web3) -> Optional[Any]:
     return None
 
 
-def with_retry(max_retries: int = 5, base_delay: int = 1):
+def with_retry(max_retries: int = 1, base_delay: int = 0):
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
@@ -193,17 +189,11 @@ def with_retry(max_retries: int = 5, base_delay: int = 1):
                     return func(*args, **kwargs)
                 except (Web3Exception, ConnectionError, TimeoutError) as e:
                     last_exc = e
+                    safe = sanitize_err(str(e))
                     if attempt < max_retries - 1:
-                        err_msg = str(e)
-                        is_rate_limit = "'code': -32005" in err_msg or "rate limit" in err_msg.lower() or "quota" in err_msg.lower() or "exceeded" in err_msg.lower()
-                        if is_rate_limit:
-                            delay = RATE_LIMIT_WAIT + random.uniform(0, 5)
-                        else:
-                            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning(f"RPC error: {e}. Retry {attempt + 1}/{max_retries} in {delay:.0f}s")
-                        sleep(delay)
+                        logger.warning(f"RPC error: {safe}. Immediate retry {attempt + 1}/{max_retries}")
                     else:
-                        logger.error(f"RPC error after {max_retries} retries: {e}")
+                        logger.warning(f"RPC error: {safe}")
             raise last_exc
         return wrapper
     return decorator

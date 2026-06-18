@@ -7,13 +7,12 @@ from web3.types import TxReceipt
 
 from src.config import config
 from src.constants import HYPE_DECIMALS, USDC_DECIMALS
-from src.provider import with_retry, get_account, rpc_manager
+from src.provider import with_retry, get_account, rpc_manager, estimate_gas, sanitize_err
 from src.math_utils import get_tick_spacing, get_token_order, calculate_bounds, get_price_from_sqrt_price
 
 logger = logging.getLogger("liqbot")
 
 _hype_price_usd: Optional[float] = None
-MAX_TX_FEE_USD = 0.05
 
 
 class TxFeeExceeded(Exception):
@@ -25,9 +24,9 @@ def set_hype_price(price: float) -> None:
     _hype_price_usd = price
 
 
-def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxReceipt]:
+def send_transaction(w3: Web3, tx: dict, dry_run: bool = False, priority: bool = False) -> Optional[TxReceipt]:
     if dry_run:
-        logger.info(f"[DRY-RUN] Would send tx: from={tx['from']} nonce={tx['nonce']}")
+        logger.info(f"[DRY-RUN] Would send tx: from={tx['from'][:10]}... nonce={tx['nonce']}")
         return None
 
     account = get_account(w3)
@@ -43,13 +42,14 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
         gas_cost_hype = gas_cost_wei / 1e18
         logger.info(f"Tx confirmed: {tx_hash.hex()} (gas used: {gas_used}, fee: {gas_cost_hype:.9f} HYPE)")
 
+        max_fee_usd = config.MAX_TX_FEE_USD_PRIORITY if priority else config.MAX_TX_FEE_USD_REGULAR
         if _hype_price_usd is not None:
             gas_cost_usd = gas_cost_hype * _hype_price_usd
-            if gas_cost_usd > MAX_TX_FEE_USD:
+            if gas_cost_usd > max_fee_usd:
                 logger.warning(
-                    f"Tx fee ${gas_cost_usd:.4f} exceeds ${MAX_TX_FEE_USD:.2f}, raising TxFeeExceeded"
+                    f"Tx fee ${gas_cost_usd:.4f} exceeds ${max_fee_usd:.2f}, raising TxFeeExceeded"
                 )
-                raise TxFeeExceeded(f"Tx fee ${gas_cost_usd:.4f} > ${MAX_TX_FEE_USD:.2f}")
+                raise TxFeeExceeded(f"Tx fee ${gas_cost_usd:.4f} > ${max_fee_usd:.2f}")
     else:
         revert_reason = ""
         try:
@@ -58,7 +58,7 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False) -> Optional[TxRe
             revert_reason = str(e)
         msg = f"Transaction reverted: {tx_hash.hex()}"
         if revert_reason:
-            msg += f". Reason: {revert_reason}"
+            msg += f". Reason: {sanitize_err(revert_reason)}"
         logger.error(msg)
         raise ValueError(msg)
 
@@ -71,16 +71,35 @@ def build_deadline(w3: Web3, seconds_ahead: int = 600) -> int:
 
 def build_tx_params(w3: Web3, gas: int, priority: bool = False) -> dict:
     account = get_account(w3)
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas")
+    nonce = w3.eth.get_transaction_count(account.address)
+
+    if base_fee is not None:
+        priority_fee = w3.to_wei(config.MAX_PRIORITY_FEE_PER_GAS, "gwei")
+        if priority:
+            priority_fee = int(priority_fee * config.PRIORITY_FEE_MULTIPLIER_PRIORITY)
+        max_fee = base_fee * 2 + priority_fee
+        if priority:
+            max_fee = int(max_fee * config.PRIORITY_FEE_MULTIPLIER)
+        return {
+            "from": account.address,
+            "nonce": nonce,
+            "gas": gas,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": priority_fee,
+        }
+
     gas_price = int(w3.eth.gas_price * config.PRIORITY_FEE_MULTIPLIER) if priority else w3.eth.gas_price
     return {
         "from": account.address,
-        "nonce": w3.eth.get_transaction_count(account.address),
+        "nonce": nonce,
         "gas": gas,
         "gasPrice": gas_price,
     }
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def get_current_price(w3: Web3, pool_contract) -> Tuple[float, int, int]:
     slot0 = pool_contract.functions.slot0().call()
     sqrt_price_x96 = slot0[0]
@@ -93,7 +112,7 @@ def get_current_price(w3: Web3, pool_contract) -> Tuple[float, int, int]:
     return price, current_tick, sqrt_price_x96
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def get_position_details(w3: Web3, position_manager, token_id: int) -> Optional[dict]:
     try:
         pos = position_manager.functions.positions(token_id).call()
@@ -112,11 +131,11 @@ def get_position_details(w3: Web3, position_manager, token_id: int) -> Optional[
             "tokensOwed1": pos[11],
         }
     except Exception as e:
-        logger.warning(f"Could not fetch position {token_id}: {e}")
+        logger.warning(f"Could not fetch position {token_id}: {sanitize_err(str(e))}")
         return None
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def get_token_balances(w3: Web3) -> Tuple[int, int]:
     from src.provider import get_hype_contract, get_usdc_contract
     hype = get_hype_contract(w3)
@@ -127,7 +146,7 @@ def get_token_balances(w3: Web3) -> Tuple[int, int]:
     return hype_bal, usdc_bal
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def approve_token(w3: Web3, token_contract, spender: str, amount: int, dry_run: bool = False, priority: bool = False) -> None:
     account = get_account(w3)
     spender_addr = Web3.to_checksum_address(spender)
@@ -136,13 +155,12 @@ def approve_token(w3: Web3, token_contract, spender: str, amount: int, dry_run: 
         return
 
     logger.info(f"Approving {spender} for {amount}")
-    tx = token_contract.functions.approve(spender_addr, amount).build_transaction(
-        build_tx_params(w3, 100_000, priority=priority)
-    )
-    send_transaction(w3, tx, dry_run)
+    params = build_tx_params(w3, 100_000, priority=priority)
+    tx = token_contract.functions.approve(spender_addr, amount).build_transaction(params)
+    send_transaction(w3, tx, dry_run, priority=priority)
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def collect_fees(
     w3: Web3, position_manager, token_id: int, dry_run: bool = False, priority: bool = False
 ) -> Tuple[Optional[int], Optional[int]]:
@@ -159,7 +177,7 @@ def collect_fees(
         build_tx_params(w3, 200_000, priority=priority)
     )
 
-    receipt = send_transaction(w3, tx, dry_run)
+    receipt = send_transaction(w3, tx, dry_run, priority=priority)
     if receipt:
         bal_after_0, bal_after_1 = get_token_balances(w3)
         amount0 = bal_after_0 - bal_before_0
@@ -169,7 +187,7 @@ def collect_fees(
     return None, None
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def remove_liquidity(
     w3: Web3, position_manager, token_id: int, liquidity: int, dry_run: bool = False, priority: bool = False
 ) -> Tuple[Optional[int], Optional[int]]:
@@ -187,7 +205,7 @@ def remove_liquidity(
         build_tx_params(w3, 300_000, priority=priority)
     )
 
-    receipt = send_transaction(w3, tx, dry_run)
+    receipt = send_transaction(w3, tx, dry_run, priority=priority)
     if receipt:
         bal_after_0, bal_after_1 = get_token_balances(w3)
         amount0 = bal_after_0 - bal_before_0
@@ -197,7 +215,7 @@ def remove_liquidity(
     return None, None
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def mint_position(
     w3: Web3,
     position_manager,
@@ -256,7 +274,7 @@ def mint_position(
     return None
 
 
-@with_retry(max_retries=3, base_delay=2)
+@with_retry()
 def increase_liquidity(
     w3: Web3,
     position_manager,
@@ -462,7 +480,7 @@ def create_position(
                     sleep(config.TX_INTER_SLEEP)
                     increase_liquidity(w3_chain, position_manager, new_token_id, add0, add1, dry_run)
         except Exception as e:
-            logger.warning(f"Top-up failed (non-critical): {e}")
+            logger.warning(f"Top-up failed (non-critical): {sanitize_err(str(e))}")
     else:
         logger.warning("Position creation failed or could not determine tokenId")
 
@@ -475,10 +493,12 @@ def wrap_hype(w3: Web3, amount: int, dry_run: bool = False) -> bool:
     from src.provider import get_whype_contract
     whype = get_whype_contract(w3)
     logger.info(f"Wrapping {amount / 1e18:.4f} HYPE to wHYPE")
+    params = build_tx_params(w3, 0)
     tx = whype.functions.deposit().build_transaction({
-        **build_tx_params(w3, 100_000),
+        **params,
         "value": amount,
     })
+    tx["gas"] = estimate_gas(w3, tx)
     receipt = send_transaction(w3, tx, dry_run)
     return receipt is not None and receipt["status"] == 1
 
@@ -501,6 +521,8 @@ def swap_exact_input_single(
     token_in_is_hype = token_in.lower() == config.HYPE_ADDRESS.lower()
     dec_in = HYPE_DECIMALS if token_in_is_hype else USDC_DECIMALS
     logger.info(f"Swapping {amount_in / 10**dec_in:.6f} {'HYPE' if token_in_is_hype else 'USDC'} for {'USDC' if token_in_is_hype else 'HYPE'} via fee={fee}")
+
+    bal_before_hype, bal_before_usdc = get_token_balances(w3)
 
     for attempt in range(3):
         deadline = build_deadline(w3)
@@ -532,15 +554,17 @@ def swap_exact_input_single(
         }).build_transaction(build_tx_params(w3, 300_000, priority=priority))
 
         try:
-            receipt = send_transaction(w3, tx, dry_run)
+            receipt = send_transaction(w3, tx, dry_run, priority=priority)
+            if receipt:
+                bal_after_hype, bal_after_usdc = get_token_balances(w3)
+                amount_out = (bal_after_usdc - bal_before_usdc) if token_in_is_hype else (bal_after_hype - bal_before_hype)
+                logger.info(f"Swap successful: {amount_out} output tokens received")
+                return amount_out
             return None
         except Exception as e:
             if attempt >= 2:
                 raise
-            is_slippage = not priority and amount_out_min > 0
-            delay = 2 if is_slippage else 2
-            logger.warning(f"Swap attempt {attempt + 1} failed, retrying in {delay}s: {e}")
-            sleep(delay)
+            logger.warning(f"Swap attempt {attempt + 1} failed, retrying immediately: {sanitize_err(str(e))}")
 
     return None
 

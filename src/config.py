@@ -33,6 +33,10 @@ class Config:
     MIN_WALLET_USD: float = float(os.getenv("MIN_WALLET_USD", "0.2"))
     UNTOUCHABLE_HYPE: float = float(os.getenv("UNTOUCHABLE_HYPE", "0.02"))
     PRIORITY_FEE_MULTIPLIER: float = float(os.getenv("PRIORITY_FEE_MULTIPLIER", "1.5"))
+    MAX_PRIORITY_FEE_PER_GAS: float = float(os.getenv("MAX_PRIORITY_FEE_PER_GAS", "0.1"))
+    PRIORITY_FEE_MULTIPLIER_PRIORITY: float = float(os.getenv("PRIORITY_FEE_MULTIPLIER_PRIORITY", "2.0"))
+    MAX_TX_FEE_USD_REGULAR: float = float(os.getenv("MAX_TX_FEE_USD_REGULAR", "0.05"))
+    MAX_TX_FEE_USD_PRIORITY: float = float(os.getenv("MAX_TX_FEE_USD_PRIORITY", "1.0"))
 
     # DEPRECATED: use SECONDARY_INNER instead
     DOWNWARD_CYCLE_INTERVAL: int = int(os.getenv("DOWNWARD_CYCLE_INTERVAL", "600"))

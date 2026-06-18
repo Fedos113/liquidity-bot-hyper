@@ -1,7 +1,9 @@
 import logging
 import signal
 import threading
+from datetime import datetime
 from time import sleep, time
+from typing import Optional
 
 from web3 import Web3
 from web3.exceptions import Web3Exception
@@ -15,6 +17,7 @@ from src.provider import (
     get_hype_contract,
     get_usdc_contract,
     rpc_manager,
+    sanitize_err,
 )
 from src.math_utils import (
     get_price_from_sqrt_price,
@@ -50,6 +53,82 @@ upward_inner_event = threading.Event()
 _pool_cache = {}
 _pool_cache_lock = threading.Lock()
 pool_opened = False
+
+
+class ChartLogger:
+    def __init__(self, path: str = "chart.log"):
+        self.path = path
+        self.initial_balance: Optional[float] = None
+        self.initial_price: Optional[float] = None
+        self.last_balance: Optional[float] = None
+        self.last_price: Optional[float] = None
+        self._initialized = False
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _pnl(self, current_balance: float) -> str:
+        if self.initial_balance and self.initial_balance > 0:
+            pct = (current_balance / self.initial_balance - 1) * 100
+            return f"{pct:+.2f}%"
+        return "+0.00%"
+
+    def initial_pool(self, price: float, lower: float, upper: float,
+                     tp_threshold: float, sl_threshold: float, total_balance: float):
+        self.initial_price = price
+        self.initial_balance = total_balance
+        self.last_price = price
+        self.last_balance = total_balance
+        self._initialized = True
+        with open(self.path, "a") as f:
+            f.write("=" * 124 + "\n")
+            f.write(f"{self._ts()}: Initial Pool created at {price:.2f}: "
+                    f"{lower:.4f} - {upper:.4f} ; "
+                    f"TP: {tp_threshold:.2f} SL: {sl_threshold:.2f}; "
+                    f"Initial balance: ${total_balance:.2f}\n")
+
+    def tp_triggered(self, price: float, total_balance: float):
+        self.last_price = price
+        self.last_balance = total_balance
+        pnl = self._pnl(total_balance)
+        with open(self.path, "a") as f:
+            f.write(f"{self._ts()}: TP triggered PNL: {pnl}: "
+                    f"USDC swapped to HYPE at {price:.2f} ; "
+                    f"Balance: ${total_balance:.2f}\n")
+
+    def pool_created(self, price: float, lower: float, upper: float,
+                     tp_threshold: float, sl_threshold: float, total_balance: float):
+        self.last_price = price
+        self.last_balance = total_balance
+        pnl = self._pnl(total_balance)
+        with open(self.path, "a") as f:
+            f.write(f"{self._ts()}: Pool created at {price:.2f}, PNL: {pnl}: "
+                    f"{lower:.4f} - {upper:.4f} ; "
+                    f"TP: {tp_threshold:.2f} SL: {sl_threshold:.2f}; "
+                    f"Balance: ${total_balance:.2f}\n")
+
+    def sl_triggered(self, price: float, total_balance: float):
+        self.last_price = price
+        self.last_balance = total_balance
+        pnl = self._pnl(total_balance)
+        with open(self.path, "a") as f:
+            f.write(f"{self._ts()}: SL triggered, PNL: {pnl}: "
+                    f"HYPE swapped to USDC at {price:.2f}; "
+                    f"Balance: ${total_balance:.2f}\n")
+
+    def bot_stopped(self, price: float, total_balance: float):
+        if not self._initialized:
+            return
+        pnl = self._pnl(total_balance)
+        with open(self.path, "a") as f:
+            f.write(f"{self._ts()}: Bot stopped at {price:.2f}; "
+                    f"PNL: {pnl}; "
+                    f"Balance: ${total_balance:.2f}\n")
+            f.write("=" * 124 + "\n")
+
+
+chart_logger = ChartLogger()
+_logged_initial_pool = False
 
 
 def signal_handler(sig, frame):
@@ -171,13 +250,15 @@ def _compute_unclaimed_fees(pos, fg0, fg1, current_tick, lower_tick, upper_tick)
 
 
 def _close_pool_3rpc(cache, tid, pos, dry_run):
-    """Close position: collect fees, remove liquidity — priority gas for speed."""
+    """Close position: collect fees, remove liquidity, collect principal — priority gas for speed."""
     try:
         w3_slot0 = rpc_manager.get_web3_for_slot(0)
         w3_slot1 = rpc_manager.get_web3_for_slot(1)
+        w3_slot2 = rpc_manager.get_web3_for_slot(2)
 
         pm_slot0 = get_position_manager_contract(w3_slot0)
         pm_slot1 = get_position_manager_contract(w3_slot1)
+        pm_slot2 = get_position_manager_contract(w3_slot2)
 
         pool_slot0 = get_pool_contract(w3_slot0)
 
@@ -188,21 +269,18 @@ def _close_pool_3rpc(cache, tid, pos, dry_run):
         sleep(config.TX_INTER_SLEEP)
 
         remove_liquidity(w3_slot1, pm_slot1, tid, pos["liquidity"], dry_run, priority=True)
+        sleep(config.TX_INTER_SLEEP)
+
+        collect_fees(w3_slot2, pm_slot2, tid, dry_run, priority=True)
 
         return current_price
     except (Web3Exception, ConnectionError, TimeoutError, ValueError):
         raise
 
 
-def _handle_rpc_error(e, failed_w3=None):
-    err_msg = str(e)
-    is_quota = "quota" in err_msg.lower() or "exceeded" in err_msg.lower() or "'code': -32005" in err_msg
+def _handle_rpc_error(e, failed_w3):
     try:
-        w3 = failed_w3 or get_web3()
-        if is_quota:
-            rpc_manager.on_quota_exceeded(w3)
-        else:
-            rpc_manager.on_error(w3)
+        rpc_manager.on_error(failed_w3)
     except Exception:
         pass
 
@@ -240,6 +318,7 @@ def _secondary_cycle():
                 sleep(1)
             continue
 
+        w3 = None
         try:
             w3 = get_web3()
             pool = get_pool_contract(w3)
@@ -297,9 +376,12 @@ def _secondary_cycle():
             else:
                 logger.info("[SECONDARY] No active position")
 
+        except (Web3Exception, ConnectionError, TimeoutError) as e:
+            logger.warning(f"[SECONDARY] RPC error: {sanitize_err(str(e))}, cycling provider")
+            if w3 is not None:
+                _handle_rpc_error(e, w3)
         except Exception as e:
-            logger.warning(f"[SECONDARY] Cycle error: {e}")
-            _handle_rpc_error(e, w3)
+            logger.warning(f"[SECONDARY] Cycle error: {sanitize_err(str(e))}")
 
         elapsed = time() - cycle_start
         remaining = config.SECONDARY_INNER - elapsed
@@ -323,6 +405,7 @@ def _downward_inner_cycle():
             cycle_start = time()
             success = False
 
+            w3 = None
             try:
                 w3 = get_web3()
                 pool = get_pool_contract(w3)
@@ -340,7 +423,8 @@ def _downward_inner_cycle():
                         tid = new_id
 
                 if tid > 0 and pos and pos["liquidity"] > 0:
-                    _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
+                    current_price = _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
+                    set_hype_price(current_price)
                 else:
                     current_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
                     set_hype_price(current_price)
@@ -351,10 +435,13 @@ def _downward_inner_cycle():
                         swap_w3 = rpc_manager.get_web3_for_swap()
                         swap_pool = get_pool_contract(swap_w3)
                         swap_cache = _get_pool_cache(swap_w3, swap_pool)
-                        swap_exact_input_single(
+                        amt_out = swap_exact_input_single(
                             swap_w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
                             swap_cache["fee"], hype_bal, config.DRY_RUN, priority=True,
                         )
+                        if amt_out is not None:
+                            final_usdc = (usdc_bal + amt_out) / 10 ** USDC_DECIMALS
+                            chart_logger.sl_triggered(current_price, final_usdc)
                         logger.info("[DOWNWARD-INNER] All wHYPE swapped to USDC")
 
                     pool_opened = False
@@ -364,10 +451,11 @@ def _downward_inner_cycle():
             except TxFeeExceeded as e:
                 logger.warning(f"[DOWNWARD-INNER] {e}, retrying in {config.DOWNWARD_INNER_CYCLE_INTERVAL}s")
             except (Web3Exception, ConnectionError, TimeoutError) as e:
-                logger.warning(f"[DOWNWARD-INNER] RPC error: {e}, cycling provider")
-                _handle_rpc_error(e, w3)
+                logger.warning(f"[DOWNWARD-INNER] RPC error: {sanitize_err(str(e))}, cycling provider")
+                if w3 is not None:
+                    _handle_rpc_error(e, w3)
             except Exception as e:
-                logger.warning(f"[DOWNWARD-INNER] Error: {e}, retrying in {config.DOWNWARD_INNER_CYCLE_INTERVAL}s")
+                logger.warning(f"[DOWNWARD-INNER] Error: {sanitize_err(str(e))}, retrying in {config.DOWNWARD_INNER_CYCLE_INTERVAL}s")
 
             if success:
                 downward_inner_event.clear()
@@ -395,6 +483,7 @@ def _upward_inner_cycle():
             cycle_start = time()
             success = False
 
+            w3 = None
             try:
                 w3 = get_web3()
                 pool = get_pool_contract(w3)
@@ -412,7 +501,8 @@ def _upward_inner_cycle():
                         tid = new_id
 
                 if tid > 0 and pos and pos["liquidity"] > 0:
-                    _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
+                    current_price = _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
+                    set_hype_price(current_price)
                 else:
                     current_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
                     set_hype_price(current_price)
@@ -423,10 +513,14 @@ def _upward_inner_cycle():
                         swap_w3 = rpc_manager.get_web3_for_swap()
                         swap_pool = get_pool_contract(swap_w3)
                         swap_cache = _get_pool_cache(swap_w3, swap_pool)
-                        swap_exact_input_single(
+                        amt_out = swap_exact_input_single(
                             swap_w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
                             swap_cache["fee"], usdc_bal, config.DRY_RUN, priority=True,
                         )
+                        if amt_out is not None:
+                            final_hype = (hype_bal + amt_out) / 10 ** HYPE_DECIMALS
+                            total = final_hype * current_price
+                            chart_logger.tp_triggered(current_price, total)
                         logger.info("[UPWARD-INNER] All USDC swapped to HYPE")
 
                     pool_opened = False
@@ -436,10 +530,11 @@ def _upward_inner_cycle():
             except TxFeeExceeded as e:
                 logger.warning(f"[UPWARD-INNER] {e}, retrying in {config.UPWARD_INNER_CYCLE_INTERVAL}s")
             except (Web3Exception, ConnectionError, TimeoutError) as e:
-                logger.warning(f"[UPWARD-INNER] RPC error: {e}, cycling provider")
-                _handle_rpc_error(e, w3)
+                logger.warning(f"[UPWARD-INNER] RPC error: {sanitize_err(str(e))}, cycling provider")
+                if w3 is not None:
+                    _handle_rpc_error(e, w3)
             except Exception as e:
-                logger.warning(f"[UPWARD-INNER] Error: {e}, retrying in {config.UPWARD_INNER_CYCLE_INTERVAL}s")
+                logger.warning(f"[UPWARD-INNER] Error: {sanitize_err(str(e))}, retrying in {config.UPWARD_INNER_CYCLE_INTERVAL}s")
 
             if success:
                 upward_inner_event.clear()
@@ -517,6 +612,7 @@ def run_bot():
                 sleep(1)
             continue
 
+        w3 = None
         try:
             w3 = get_web3()
             pool = get_pool_contract(w3)
@@ -563,6 +659,14 @@ def run_bot():
                         )
                         logger.info(f"Wallet value: ~${wallet_val:.2f}")
 
+                        if not _logged_initial_pool:
+                            target_lower = current_price * config.LOWER_BOUND_PCT
+                            target_upper = current_price * config.UPPER_BOUND_PCT
+                            tp = target_upper * config.HYPE_UPPER_THRESHOLD
+                            sl = target_lower * config.HYPE_DROP_THRESHOLD
+                            chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
+                            _logged_initial_pool = True
+
                         in_range = lower_price <= current_price <= upper_price
 
                         if pos_val > 1.0:
@@ -582,6 +686,15 @@ def run_bot():
                                     config.TOKEN_ID = new_id
                                     position_minted = True
                                     pool_opened = True
+                                    target_lower = current_price * config.LOWER_BOUND_PCT
+                                    target_upper = current_price * config.UPPER_BOUND_PCT
+                                    tp = target_upper * config.HYPE_UPPER_THRESHOLD
+                                    sl = target_lower * config.HYPE_DROP_THRESHOLD
+                                    if not _logged_initial_pool:
+                                        chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
+                                        _logged_initial_pool = True
+                                    else:
+                                        chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
                                     logger.info(f"Created new position ID {token_id}")
                                 else:
                                     pool_opened = False
@@ -631,6 +744,15 @@ def run_bot():
                                 config.TOKEN_ID = new_id
                                 position_minted = True
                                 pool_opened = True
+                                target_lower = current_price * config.LOWER_BOUND_PCT
+                                target_upper = current_price * config.UPPER_BOUND_PCT
+                                tp = target_upper * config.HYPE_UPPER_THRESHOLD
+                                sl = target_lower * config.HYPE_DROP_THRESHOLD
+                                if not _logged_initial_pool:
+                                    chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
+                                    _logged_initial_pool = True
+                                else:
+                                    chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
                                 logger.info(f"Created new position ID {token_id}")
                             else:
                                 pool_opened = False
@@ -648,6 +770,16 @@ def run_bot():
                             token_id_ref[0] = new_id
                             position_minted = True
                             pool_opened = True
+                            wallet_val = calculate_usdc_value(current_price, usdc_bal / 10**USDC_DECIMALS, hype_bal / 10**HYPE_DECIMALS)
+                            target_lower = current_price * config.LOWER_BOUND_PCT
+                            target_upper = current_price * config.UPPER_BOUND_PCT
+                            tp = target_upper * config.HYPE_UPPER_THRESHOLD
+                            sl = target_lower * config.HYPE_DROP_THRESHOLD
+                            if not _logged_initial_pool:
+                                chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val)
+                                _logged_initial_pool = True
+                            else:
+                                chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val)
                         config.TOKEN_ID = new_id
                         logger.info(f"Created new position ID {token_id}")
             except TxFeeExceeded as e:
@@ -655,11 +787,12 @@ def run_bot():
                 cycle_error = True
 
         except (Web3Exception, ConnectionError, TimeoutError) as e:
-            logger.warning(f"RPC error in main cycle: {e}, cycling provider")
-            _handle_rpc_error(e, w3)
+            logger.warning(f"RPC error in main cycle: {sanitize_err(str(e))}, cycling provider")
+            if w3 is not None:
+                _handle_rpc_error(e, w3)
             cycle_error = True
         except Exception as e:
-            logger.warning(f"Cycle error, retrying in 60s: {e}")
+            logger.warning(f"Cycle error, retrying in 60s: {sanitize_err(str(e))}")
             cycle_error = True
 
         elapsed = time() - cycle_start
@@ -674,6 +807,16 @@ def run_bot():
             if upper_threshold_event.is_set():
                 logger.info("Upper threshold triggered by secondary, starting next cycle...")
                 upper_threshold_event.clear()
+
+    try:
+        w3 = get_web3()
+        pool = get_pool_contract(w3)
+        final_price, _, _, final_hype, final_usdc = _multicall_price_and_balances(w3, pool)
+        wallet_val = calculate_usdc_value(final_price, final_usdc / 10 ** USDC_DECIMALS, final_hype / 10 ** HYPE_DECIMALS)
+        chart_logger.bot_stopped(final_price, wallet_val)
+    except Exception:
+        if chart_logger.last_balance is not None and chart_logger.last_price is not None:
+            chart_logger.bot_stopped(chart_logger.last_price, chart_logger.last_balance)
 
     logger.info("Bot stopped.")
 
