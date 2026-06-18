@@ -50,6 +50,7 @@ class Config:
 
     SECONDARY_INNER: int = int(os.getenv("SECONDARY_INNER", "300"))
     TX_INTER_SLEEP: int = int(os.getenv("TX_INTER_SLEEP", "1"))
+    TP_AGGRESSIVE: bool = os.getenv("TP_AGGRESSIVE", "false").lower() == "true"
 
     def validate(self):
         required = [

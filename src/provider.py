@@ -1,4 +1,5 @@
 import logging
+import time
 from functools import wraps
 from typing import Any, Callable, Optional
 
@@ -67,7 +68,7 @@ class RPCManager:
         if config.HYPE_RPC_API_KEY:
             self.providers.append(RPCProvider(
                 "HypeRPC (API)",
-                f"https://evmrpc-eu.hyperpc.app/{config.HYPE_RPC_API_KEY}?apikey={config.HYPE_RPC_API_KEY}",
+                f"https://evmrpc-eu.hyperpc.app/8d7784244f0743f0a4e7b6bd03202806?apikey={config.HYPE_RPC_API_KEY}",
             ))
         if config.ALCHEMY_API_KEY:
             self.providers.append(RPCProvider(
@@ -99,6 +100,12 @@ class RPCManager:
             if p.connect():
                 return p.web3
         raise ConnectionError("No active RPC providers available")
+
+    def get_web3_skip(self, skip_w3: Web3) -> Web3:
+        for p in self.get_active():
+            if p.web3 and p.web3 is not skip_w3:
+                return p.web3
+        return self.get_web3()
 
     def get_web3_for_slot(self, slot: int) -> Web3:
         active = self.get_active()
@@ -135,11 +142,9 @@ class RPCManager:
     def on_error(self, failed_w3: Web3) -> Web3:
         for p in self.providers:
             if p.web3 is failed_w3:
-                p.active = False
-                p.web3 = None
-                logger.warning(f"RPC provider {p.name} disabled (error)")
+                logger.warning(f"RPC provider {p.name} error (kept active)")
                 break
-        next_w3 = self.get_web3()
+        next_w3 = self.get_web3_skip(failed_w3)
         logger.info(f"RPC switched to next active provider")
         return next_w3
 
@@ -183,18 +188,32 @@ def with_retry(max_retries: int = 1, base_delay: int = 0):
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
-            last_exc = None
-            for attempt in range(max_retries):
+            while True:
                 try:
                     return func(*args, **kwargs)
                 except (Web3Exception, ConnectionError, TimeoutError) as e:
-                    last_exc = e
-                    safe = sanitize_err(str(e))
-                    if attempt < max_retries - 1:
-                        logger.warning(f"RPC error: {safe}. Immediate retry {attempt + 1}/{max_retries}")
-                    else:
-                        logger.warning(f"RPC error: {safe}")
-            raise last_exc
+                    logger.warning(f"RPC error: {sanitize_err(str(e))}")
+                if not (args and isinstance(args[0], Web3)):
+                    raise
+                skip_w3 = args[0]
+                rotated = {id(skip_w3)}
+                all_tried = True
+                for _ in range(len(rpc_manager.get_active())):
+                    new_w3 = skip_w3
+                    try:
+                        new_w3 = rpc_manager.get_web3_skip(skip_w3)
+                        wid = id(new_w3)
+                        if wid in rotated:
+                            break
+                        rotated.add(wid)
+                        new_args = (new_w3,) + args[1:]
+                        logger.info(f"Rotated, retrying {func.__name__}")
+                        return func(*new_args, **kwargs)
+                    except (Web3Exception, ConnectionError, TimeoutError) as e:
+                        logger.warning(f"Rotation retry of {func.__name__} failed: {sanitize_err(str(e))}")
+                        skip_w3 = new_w3
+                logger.warning(f"All providers failed on {func.__name__}, retrying in 5s...")
+                time.sleep(5)
         return wrapper
     return decorator
 

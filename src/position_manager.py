@@ -293,7 +293,7 @@ def increase_liquidity(
     if amount0_desired == 0 and amount1_desired == 0:
         return True
 
-    sleep(2)
+    time.sleep(2)
     deadline = build_deadline(w3)
     amount0_min = 0
     amount1_min = 0
@@ -313,6 +313,7 @@ def increase_liquidity(
     return receipt is not None and receipt["status"] == 1
 
 
+@with_retry()
 def add_to_position(
     w3: Web3,
     position_manager,
@@ -368,6 +369,7 @@ def add_to_position(
     return increase_liquidity(w3, position_manager, token_id, add0, add1, dry_run)
 
 
+@with_retry()
 def create_position(
     w3: Web3,
     position_manager,
@@ -481,10 +483,10 @@ def create_position(
                 add0, add1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
                 add0, add1 = max(1, add0), max(1, add1)
                 if add0 > 1 or add1 > 1:
-                    sleep(config.TX_INTER_SLEEP)
+                    time.sleep(config.TX_INTER_SLEEP)
                     approve_token(w3_hype, get_hype_or_usdc(w3_hype, token0_is_hype), config.POSITION_MANAGER_ADDRESS, add0, dry_run)
                     approve_token(w3_hype, get_hype_or_usdc(w3_hype, not token0_is_hype), config.POSITION_MANAGER_ADDRESS, add1, dry_run)
-                    sleep(config.TX_INTER_SLEEP)
+                    time.sleep(config.TX_INTER_SLEEP)
                     increase_liquidity(w3_chain, position_manager, new_token_id, add0, add1, dry_run)
         except Exception as e:
             logger.warning(f"Top-up failed (non-critical): {sanitize_err(str(e))}")
@@ -494,6 +496,7 @@ def create_position(
     return new_token_id
 
 
+@with_retry()
 def wrap_hype(w3: Web3, amount: int, dry_run: bool = False) -> bool:
     if amount <= 0:
         return True
@@ -510,6 +513,7 @@ def wrap_hype(w3: Web3, amount: int, dry_run: bool = False) -> bool:
     return receipt is not None and receipt["status"] == 1
 
 
+@with_retry()
 def swap_exact_input_single(
     w3: Web3,
     token_in: str,
@@ -576,6 +580,7 @@ def swap_exact_input_single(
     return None
 
 
+@with_retry()
 def balance_tokens(
     w3: Web3,
     dry_run: bool = False,
@@ -598,6 +603,7 @@ def balance_tokens(
         logger.warning("No wHYPE or USDC available after wrapping")
 
 
+@with_retry()
 def _optimize_ratio(
     w3: Web3,
     pool_contract,
