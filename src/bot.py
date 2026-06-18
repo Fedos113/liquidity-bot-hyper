@@ -53,6 +53,11 @@ upward_inner_event = threading.Event()
 _pool_cache = {}
 _pool_cache_lock = threading.Lock()
 pool_opened = False
+_cached_price = 0.0
+_cached_lower_price = 0.0
+_cached_upper_price = 0.0
+_cached_drop_trigger = 0.0
+_cached_surge_trigger = 0.0
 
 
 class ChartLogger:
@@ -286,7 +291,7 @@ def _handle_rpc_error(e, failed_w3):
 
 
 def _secondary_cycle():
-    global running, tx_lock, token_id_ref, pool_opened
+    global running, tx_lock, pool_opened, _cached_price, _cached_lower_price, _cached_upper_price, _cached_drop_trigger, _cached_surge_trigger
 
     logger.info(f"[SECONDARY] Initial delay {config.SECONDARY_INNER}s before first cycle")
     for _ in range(config.SECONDARY_INNER):
@@ -299,7 +304,7 @@ def _secondary_cycle():
         logger.info("[SECONDARY] Cycle start")
 
         if tx_lock.locked():
-            logger.info("[SECONDARY] Main cycle active, skipping RPC reads")
+            logger.info("[SECONDARY] Main cycle active, skipping")
             elapsed = time() - cycle_start
             remaining = config.SECONDARY_INNER - elapsed
             for _ in range(int(max(remaining, 0))):
@@ -309,7 +314,7 @@ def _secondary_cycle():
             continue
 
         if not pool_opened:
-            logger.info("[SECONDARY] Pool not opened, skipping price check")
+            logger.info("[SECONDARY] Pool not opened, skipping")
             elapsed = time() - cycle_start
             remaining = config.SECONDARY_INNER - elapsed
             for _ in range(int(max(remaining, 0))):
@@ -318,70 +323,47 @@ def _secondary_cycle():
                 sleep(1)
             continue
 
-        w3 = None
         try:
-            w3 = get_web3()
-            pool = get_pool_contract(w3)
-            pm = get_position_manager_contract(w3)
-            cache = _get_pool_cache(w3, pool)
+            price = _cached_price
+            lower = _cached_lower_price
+            upper = _cached_upper_price
+            drop = _cached_drop_trigger
+            surge = _cached_surge_trigger
 
-            tid = token_id_ref[0]
-            pos = None
-            if tid > 0:
-                pos = get_position_details(w3, pm, tid)
-            if not pos or pos["liquidity"] == 0:
-                new_id, pos = _auto_discover_position(w3, pm, cache["token0"], cache["token1"])
-                if new_id is not None:
-                    token_id_ref[0] = new_id
-                    tid = new_id
-                else:
-                    pool_opened = False
-                    elapsed = time() - cycle_start
-                    remaining = config.SECONDARY_INNER - elapsed
-                    for _ in range(int(max(remaining, 0))):
-                        if not running:
-                            break
-                        sleep(1)
-                    continue
+            if price <= 0 or lower <= 0 or upper <= 0:
+                logger.info("[SECONDARY] Cached bounds not ready yet, skipping")
+                elapsed = time() - cycle_start
+                remaining = config.SECONDARY_INNER - elapsed
+                for _ in range(int(max(remaining, 0))):
+                    if not running:
+                        break
+                    sleep(1)
+                continue
 
-            if pos and pos["liquidity"] > 0:
-                current_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
-                invert = not cache["token0_is_hype"]
-                lower_price = tick_to_price(pos["tickLower"], cache["dec0"], cache["dec1"], invert)
-                upper_price = tick_to_price(pos["tickUpper"], cache["dec0"], cache["dec1"], invert)
-                upper_trigger = upper_price * config.HYPE_UPPER_THRESHOLD
-                drop_trigger = lower_price * config.HYPE_DROP_THRESHOLD
+            logger.info(
+                f"[SECONDARY] Price=${price:.4f} "
+                f"lower=${lower:.4f} upper=${upper:.4f} "
+                f"drop=${drop:.4f} surge=${surge:.4f}"
+            )
 
-                logger.info(
-                    f"[SECONDARY] Price=${current_price:.4f} "
-                    f"lower=${lower_price:.4f} upper=${upper_price:.4f} "
-                    f"drop=${drop_trigger:.4f} surge=${upper_trigger:.4f}"
+            if price > surge:
+                logger.warning(
+                    f"[SECONDARY] Price ${price:.4f} surged above upper bound, "
+                    f"triggering upward inner cycle..."
                 )
-
-                if current_price > upper_trigger:
-                    logger.warning(
-                        f"[SECONDARY] Price ${current_price:.4f} surged above upper bound, "
-                        f"triggering upward inner cycle..."
-                    )
-                    upward_inner_event.set()
-                elif current_price < drop_trigger:
-                    logger.warning(
-                        f"[SECONDARY] Price ${current_price:.4f} dropped below lower bound, "
-                        f"triggering downward inner cycle..."
-                    )
-                    downward_inner_event.set()
-                    downward_trigger_event.set()
-                else:
-                    logger.info("[SECONDARY] Price within bounds, no action")
+                upward_inner_event.set()
+            elif price < drop:
+                logger.warning(
+                    f"[SECONDARY] Price ${price:.4f} dropped below lower bound, "
+                    f"triggering downward inner cycle..."
+                )
+                downward_inner_event.set()
+                downward_trigger_event.set()
             else:
-                logger.info("[SECONDARY] No active position")
+                logger.info("[SECONDARY] Price within bounds, no action")
 
-        except (Web3Exception, ConnectionError, TimeoutError) as e:
-            logger.warning(f"[SECONDARY] RPC error: {sanitize_err(str(e))}, cycling provider")
-            if w3 is not None:
-                _handle_rpc_error(e, w3)
         except Exception as e:
-            logger.warning(f"[SECONDARY] Cycle error: {sanitize_err(str(e))}")
+            logger.warning(f"[SECONDARY] Error: {sanitize_err(str(e))}")
 
         elapsed = time() - cycle_start
         remaining = config.SECONDARY_INNER - elapsed
@@ -555,7 +537,7 @@ def _upward_inner_cycle():
 
 
 def run_bot():
-    global running, token_id_ref, pool_opened
+    global running, token_id_ref, pool_opened, _logged_initial_pool, _cached_price, _cached_lower_price, _cached_upper_price, _cached_drop_trigger, _cached_surge_trigger
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -676,6 +658,11 @@ def run_bot():
                             sl = target_lower * config.HYPE_DROP_THRESHOLD
                             chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
                             _logged_initial_pool = True
+                        _cached_price = current_price
+                        _cached_lower_price = lower_price
+                        _cached_upper_price = upper_price
+                        _cached_drop_trigger = lower_price * config.HYPE_DROP_THRESHOLD
+                        _cached_surge_trigger = upper_price * config.HYPE_UPPER_THRESHOLD
 
                         in_range = lower_price <= current_price <= upper_price
 
@@ -706,6 +693,11 @@ def run_bot():
                                     else:
                                         chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
                                     logger.info(f"Created new position ID {token_id}")
+                                    _cached_price = current_price
+                                    _cached_lower_price = target_lower
+                                    _cached_upper_price = target_upper
+                                    _cached_drop_trigger = sl
+                                    _cached_surge_trigger = tp
                                 else:
                                     pool_opened = False
                             else:
@@ -764,6 +756,11 @@ def run_bot():
                                 else:
                                     chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val + pos_val)
                                 logger.info(f"Created new position ID {token_id}")
+                                _cached_price = current_price
+                                _cached_lower_price = target_lower
+                                _cached_upper_price = target_upper
+                                _cached_drop_trigger = sl
+                                _cached_surge_trigger = tp
                             else:
                                 pool_opened = False
                     else:
@@ -792,6 +789,11 @@ def run_bot():
                                 chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val)
                         config.TOKEN_ID = new_id
                         logger.info(f"Created new position ID {token_id}")
+                        _cached_price = current_price
+                        _cached_lower_price = target_lower
+                        _cached_upper_price = target_upper
+                        _cached_drop_trigger = sl
+                        _cached_surge_trigger = tp
             except TxFeeExceeded as e:
                 logger.warning(f"{e}, skipping to next cycle with 60s delay")
                 cycle_error = True
