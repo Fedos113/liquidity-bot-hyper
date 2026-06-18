@@ -483,10 +483,10 @@ def create_position(
                 add0, add1 = (hype_bal, usdc_bal) if token0_is_hype else (usdc_bal, hype_bal)
                 add0, add1 = max(1, add0), max(1, add1)
                 if add0 > 1 or add1 > 1:
-                    sleep(config.TX_INTER_SLEEP)
+                    time.sleep(config.TX_INTER_SLEEP)
                     approve_token(w3_hype, get_hype_or_usdc(w3_hype, token0_is_hype), config.POSITION_MANAGER_ADDRESS, add0, dry_run)
                     approve_token(w3_hype, get_hype_or_usdc(w3_hype, not token0_is_hype), config.POSITION_MANAGER_ADDRESS, add1, dry_run)
-                    sleep(config.TX_INTER_SLEEP)
+                    time.sleep(config.TX_INTER_SLEEP)
                     increase_liquidity(w3_chain, position_manager, new_token_id, add0, add1, dry_run)
         except Exception as e:
             logger.warning(f"Top-up failed (non-critical): {sanitize_err(str(e))}")
