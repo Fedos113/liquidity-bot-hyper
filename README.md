@@ -118,7 +118,7 @@ python main.py --no-dry-run --log-level DEBUG
 | `ALCHEMY_API_KEY` | API key only | Constructs `https://hyperliquid-mainnet.g.alchemy.com/v2/<KEY>` |
 | `DRPC_API_KEY` | API key only | Constructs `https://lb.drpc.live/hyperliquid/<KEY>` |
 
-The bot auto-detects which keys are provided and builds a rotation chain: **HypeRPC → Chainstack → Alchemy → dRPC → HyperEVM fallback**. If a provider's quota is exceeded, it is permanently disabled for the session. On any RPC error, the bot immediately switches to the next active provider.
+The bot always prepends **public HypeRPC** (`https://rpc.hyperliquid.xyz/evm`) as the first priority — no API key needed, always available. It then auto-detects which additional keys are provided and builds: **HypeRPC (public) → HypeRPC (key) → Chainstack → Alchemy → dRPC → HyperEVM fallback**. If a provider's quota is exceeded, it is permanently disabled for the session. On any RPC error, the bot immediately switches to the next active provider.
 
 #### Optional
 
@@ -142,6 +142,10 @@ The bot auto-detects which keys are provided and builds a rotation chain: **Hype
 | `MIN_WALLET_USD` | `0.2` | Minimum wallet value to add funds |
 | `UNTOUCHABLE_HYPE` | `0.02` | Native HYPE reserved for gas fees |
 | `PRIORITY_FEE_MULTIPLIER` | `1.5` | Gas price multiplier for urgent operations |
+| `MAX_PRIORITY_FEE_PER_GAS` | `0.1` | Max priority fee per gas (gwei) for EIP-1559 |
+| `PRIORITY_FEE_MULTIPLIER_PRIORITY` | `2.0` | Additional multiplier for emergency priority txs |
+| `MAX_TX_FEE_USD_REGULAR` | `0.05` | Max tx fee in USD for routine operations ($0.05) |
+| `MAX_TX_FEE_USD_PRIORITY` | `1.0` | Max tx fee in USD for emergency close+swap ($1.00) |
 
 #### Secondary Cycle (Price Watcher)
 
@@ -219,7 +223,8 @@ Swap operations always try HypeRPC first, then fall back: Chainstack → Alchemy
 On startup, `main.py` tests every configured provider and logs status:
 
 ```
-RPC providers: 4/5 active
+RPC providers: 5/6 active
+  HypeRPC (public): active, connected
   HypeRPC: active, connected
   Chainstack: active, connected
   Alchemy: inactive, disconnected
@@ -273,6 +278,30 @@ python backtest.py --csv prices.csv --output backtest_results.csv
 
 ---
 
+## Chart Log (`chart.log`)
+
+The bot writes a structured `chart.log` file in the project root that can be consumed by charting tools or analyzed manually. Five event types are logged:
+
+| Event | Trigger | Format |
+|---|---|---|
+| `Initial Pool created` | First position ever created | `price, lower, upper, tp_threshold, sl_threshold, total_balance_usd` |
+| `TP triggered` | Price surges above upper threshold, position closed and swapped to USDC | `price, total_balance_usd` |
+| `Pool created` | Position recreated after close (rebalance, TP, SL) | `price, lower, upper, tp_threshold, sl_threshold, total_balance_usd` |
+| `SL triggered` | Price drops below lower threshold, position closed and swapped to USDC | `price, total_balance_usd` |
+| `Bot stopped` | Bot shutdown (Ctrl+C or signal) | `price, total_balance_usd` |
+
+**Zero extra RPC**: TP/SL balance is computed from pre-swap balances + swap output — no additional blockchain calls inside the inner cycle loop.
+
+### Example output
+```
+2026-06-18 12:00:00 | Initial Pool created | 3.45, 3.31, 3.59, 3.66, 3.24, 1520.42
+2026-06-18 13:00:00 | TP triggered | 3.52, 1610.88
+2026-06-18 13:05:00 | Pool created | 3.52, 3.38, 3.66, 3.73, 3.31, 1598.00
+2026-06-18 14:00:00 | Bot stopped | 3.48, 1575.30
+```
+
+---
+
 ## Potential Errors & Troubleshooting
 
 | Symptom | Likely Cause | Fix |
@@ -281,17 +310,18 @@ python backtest.py --csv prices.csv --output backtest_results.csv
 | `Missing required .env variables` | `.env` not configured | Copy `.env.example` to `.env` and fill in values |
 | `Transaction reverted` | Slippage too tight or insufficient balance | Increase `SLIPPAGE_TOLERANCE`, check wallet |
 | Bot stuck at "Sleeping for Xs" | Position value too small or no transaction needed | Wait for next cycle or type `skip` |
-| High gas fees | `MAX_TX_FEE_USD` exceeded | Increase `MAX_TX_FEE_USD` in `position_manager.py` |
+| High gas fees | `MAX_TX_FEE_USD_*` exceeded | Increase `MAX_TX_FEE_USD_REGULAR` or `MAX_TX_FEE_USD_PRIORITY` in `.env` |
 | Fee not compounding | Collected fees below threshold | Lower `FEE_COMPOUND_THRESHOLD_USD` |
 | Position keeps recreating | Price fluctuating around bounds | Widen `LOWER_BOUND_PCT` / `UPPER_BOUND_PCT` |
 
 ### RPC Error Recovery
 
-The bot automatically handles:
-- **Rate limiting** (`-32005`): waits 60s, retries with backoff
-- **Connection timeout**: cycles to next provider immediately
-- **Quota exceeded**: disables provider for the session
-- **All providers down**: raises `ConnectionError`, retries next cycle
+On **any** RPC error (timeout, rate limit, connection refused, quota exceeded), the bot immediately:
+1. **Marks the failed provider as inactive** — no retries on the same endpoint
+2. **Rotates to the next provider** in priority order for the very next call
+3. No exponential backoff, no 60s cooldown, no delays — instant failover
+
+Once disabled, a provider stays inactive for the session. If **all** providers are exhausted, the bot raises `ConnectionError` and retries from scratch on the next cycle.
 
 ---
 
@@ -326,8 +356,8 @@ The bot automatically handles:
 - **Multicall3 batching** — `slot0` + 2× `balanceOf` in 1 RPC call
 - **Merged secondary cycle** — one thread instead of two, 50% fewer watcher RPCs
 - **`TX_INTER_SLEEP`** — prevents nonce collisions between consecutive transactions
-- **`_handle_rpc_error`** with provider cycling — immediate recovery without waiting for retry timeout
-- **Quota tracking** — permanently disables exhausted providers mid-session
+- **Immediate RPC failover** — any error marks the provider inactive and rotates instantly; no exponential backoff or 60s rate-limit waits
+- **chart.log** — structured event log (Initial Pool, TP, Pool created, SL, Bot stopped) with zero extra RPC; balance derived from swap output
 
 ---
 
@@ -338,6 +368,7 @@ The bot automatically handles:
 - Always start with `DRY_RUN=true`
 - Monitor `liqbot.log` for unexpected behavior
 - Keep your `PRIVATE_KEY` secure — it signs every transaction
+- All RPC URLs (which may contain API keys) are automatically redacted from log output via `sanitize_err()`
 
 ---
 
