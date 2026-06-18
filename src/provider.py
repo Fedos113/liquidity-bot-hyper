@@ -96,12 +96,7 @@ class RPCManager:
         active = self.get_active()
         if not active:
             raise ConnectionError("No active RPC providers available")
-        if slot == 0:
-            idx = 0
-        elif slot == 1:
-            idx = min(1, len(active) - 1)
-        else:
-            idx = 0
+        idx = min(slot, len(active) - 1)
         p = active[idx]
         if not p.web3:
             p.connect()

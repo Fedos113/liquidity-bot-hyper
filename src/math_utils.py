@@ -2,7 +2,7 @@ import math
 import logging
 from typing import Tuple
 
-from src.constants import Q96, TICK_SPACINGS
+from src.constants import Q96, TICK_SPACINGS, HYPE_DECIMALS, USDC_DECIMALS
 
 logger = logging.getLogger("liqbot")
 
@@ -50,9 +50,8 @@ def get_token_order(pool_contract, hype_address: str) -> Tuple[bool, int, int]:
     if not token0_is_hype and token1_addr != hype_lower:
         raise ValueError(f"HYPE address {hype_address} not found in pool. token0={token0}, token1={token1}")
 
-    from src.config import config
-    decimals0 = config.HYPE_DECIMALS if token0_is_hype else config.USDC_DECIMALS
-    decimals1 = config.HYPE_DECIMALS if not token0_is_hype else config.USDC_DECIMALS
+    decimals0 = HYPE_DECIMALS if token0_is_hype else USDC_DECIMALS
+    decimals1 = HYPE_DECIMALS if not token0_is_hype else USDC_DECIMALS
     return token0_is_hype, decimals0, decimals1
 
 

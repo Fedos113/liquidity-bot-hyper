@@ -135,11 +135,13 @@ The bot auto-detects which keys are provided and builds a rotation chain: **Hype
 | `LOWER_BOUND_PCT` | `0.99` | Lower bound as % of current price |
 | `UPPER_BOUND_PCT` | `1.01` | Upper bound as % of current price |
 | `SLEEP_INTERVAL` | `3600` | Main cycle interval (seconds) |
+| `TX_INTER_SLEEP` | `1` | Pause between consecutive transactions |
 | `SLIPPAGE_TOLERANCE` | `0.005` | Max slippage (0.5%) |
 | `FEE_TIER` | `500` | Pool fee tier (500 = 0.05%) |
 | `FEE_COMPOUND_THRESHOLD_USD` | `5.0` | Auto-compound if fees exceed this |
 | `MIN_WALLET_USD` | `0.2` | Minimum wallet value to add funds |
 | `UNTOUCHABLE_HYPE` | `0.02` | Native HYPE reserved for gas fees |
+| `PRIORITY_FEE_MULTIPLIER` | `1.5` | Gas price multiplier for urgent operations |
 
 #### Secondary Cycle (Price Watcher)
 
@@ -163,16 +165,15 @@ The bot auto-detects which keys are provided and builds a rotation chain: **Hype
 | `UPWARD_INNER_CYCLE_INTERVAL` | `180` | Retry interval for close+swap |
 | `UPWARD_DELAY` | `60` | Wait before main cycle after surge |
 
-#### Token Decimals
-
-| Variable | Default | Description |
-|---|---|---|
-| `HYPE_DECIMALS` | `18` | HYPE token decimals |
-| `USDC_DECIMALS` | `6` | USDC token decimals |
-
 ---
 
 ## How the Bot Works
+
+### Slippage Protection
+
+Non-priority swaps (ratio optimization during rebalance/mint) use `amountOutMinimum = expected_output × (1 − SLIPPAGE_TOLERANCE)`, estimated from the pool's current `slot0` state (2 RPC calls). If the swap reverts due to slippage, it retries after 10s with a fresh price estimate.
+
+Priority swaps (emergency close+swap in inner cycles) bypass slippage protection for speed — execution certainty is prioritized over best price.
 
 ### Main Cycle (every `SLEEP_INTERVAL` seconds)
 

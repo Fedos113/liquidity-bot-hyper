@@ -32,6 +32,7 @@ class Config:
     FEE_COMPOUND_THRESHOLD_USD: float = float(os.getenv("FEE_COMPOUND_THRESHOLD_USD", "5.0"))
     MIN_WALLET_USD: float = float(os.getenv("MIN_WALLET_USD", "0.2"))
     UNTOUCHABLE_HYPE: float = float(os.getenv("UNTOUCHABLE_HYPE", "0.02"))
+    PRIORITY_FEE_MULTIPLIER: float = float(os.getenv("PRIORITY_FEE_MULTIPLIER", "1.5"))
 
     # DEPRECATED: use SECONDARY_INNER instead
     DOWNWARD_CYCLE_INTERVAL: int = int(os.getenv("DOWNWARD_CYCLE_INTERVAL", "600"))
@@ -44,10 +45,7 @@ class Config:
     HYPE_UPPER_THRESHOLD: float = float(os.getenv("HYPE_UPPER_THRESHOLD", "1.02"))
 
     SECONDARY_INNER: int = int(os.getenv("SECONDARY_INNER", "300"))
-    TX_INTER_SLEEP: int = int(os.getenv("TX_INTER_SLEEP", "3"))
-
-    HYPE_DECIMALS: int = int(os.getenv("HYPE_DECIMALS", "18"))
-    USDC_DECIMALS: int = int(os.getenv("USDC_DECIMALS", "6"))
+    TX_INTER_SLEEP: int = int(os.getenv("TX_INTER_SLEEP", "1"))
 
     def validate(self):
         required = [
