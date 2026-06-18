@@ -448,7 +448,7 @@ def create_position(
                 logger.info(f"Top-up: ${leftover_usd:.2f} leftover, optimizing...")
                 w3_evm = rpc_manager.get_web3_for_name("HyperEVM")
                 w3_hype = rpc_manager.get_web3_for_name("HypeRPC")
-                w3_chain = rpc_manager.get_web3_for_name("Chainstack")
+                w3_chain = rpc_manager.get_web3_for_name("dRPC")
                 slot0 = pool_contract.functions.slot0().call()
                 sqrt_price_x96 = slot0[0]
                 _optimize_ratio(w3_evm, pool_contract, tick_lower, tick_upper, sqrt_price_x96, token0_is_hype, leftover_raw0, leftover_raw1, dry_run, pool_fee)

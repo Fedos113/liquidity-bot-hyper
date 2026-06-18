@@ -51,7 +51,7 @@ class RPCProvider:
 
 
 class RPCManager:
-    SLOT_ORDER = ["HypeRPC", "Chainstack", "Alchemy", "dRPC"]
+    SLOT_ORDER = ["HypeRPC", "Alchemy", "dRPC", "Chainstack"]
 
     def __init__(self):
         self.providers: list[RPCProvider] = []
@@ -63,8 +63,6 @@ class RPCManager:
                 "HypeRPC",
                 f"https://evmrpc-eu.hyperpc.app/{config.HYPE_RPC_API_KEY}?apikey={config.HYPE_RPC_API_KEY}",
             ))
-        if config.CHAINSTACK_ENDPOINT:
-            self.providers.append(RPCProvider("Chainstack", config.CHAINSTACK_ENDPOINT))
         if config.ALCHEMY_API_KEY:
             self.providers.append(RPCProvider(
                 "Alchemy",
@@ -75,6 +73,8 @@ class RPCManager:
                 "dRPC",
                 f"https://lb.drpc.live/hyperliquid/{config.DRPC_API_KEY}",
             ))
+        if config.CHAINSTACK_ENDPOINT:
+            self.providers.append(RPCProvider("Chainstack", config.CHAINSTACK_ENDPOINT))
         self.providers.append(RPCProvider("HyperEVM (fallback)", config.RPC_URL))
 
     def get_active(self) -> list[RPCProvider]:
@@ -105,7 +105,7 @@ class RPCManager:
         return self.get_web3()
 
     def get_web3_for_swap(self) -> Web3:
-        priority = ["HypeRPC", "Chainstack", "Alchemy", "dRPC"]
+        priority = ["HypeRPC", "Alchemy", "dRPC", "Chainstack"]
         for name in priority:
             for p in self.providers:
                 if p.name == name and p.active:
