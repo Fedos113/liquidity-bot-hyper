@@ -1,8 +1,9 @@
 import logging
-from time import sleep
+import time
 from typing import Optional, Tuple
 
 from web3 import Web3
+from web3.exceptions import Web3Exception
 from web3.types import TxReceipt
 
 from src.config import config
@@ -66,13 +67,19 @@ def send_transaction(w3: Web3, tx: dict, dry_run: bool = False, priority: bool =
 
 
 def build_deadline(w3: Web3, seconds_ahead: int = 600) -> int:
-    return w3.eth.get_block("latest")["timestamp"] + seconds_ahead
+    try:
+        return w3.eth.get_block("latest")["timestamp"] + seconds_ahead
+    except (Web3Exception, ConnectionError, TimeoutError):
+        return int(time.time()) + seconds_ahead
 
 
 def build_tx_params(w3: Web3, gas: int, priority: bool = False) -> dict:
     account = get_account(w3)
-    latest = w3.eth.get_block("latest")
-    base_fee = latest.get("baseFeePerGas")
+    try:
+        latest = w3.eth.get_block("latest")
+        base_fee = latest.get("baseFeePerGas")
+    except (Web3Exception, ConnectionError, TimeoutError):
+        base_fee = None
     nonce = w3.eth.get_transaction_count(account.address)
 
     if base_fee is not None:

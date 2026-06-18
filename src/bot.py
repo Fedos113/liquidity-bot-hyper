@@ -564,12 +564,22 @@ def run_bot():
     dry_run = config.DRY_RUN
 
     if not dry_run:
-        w3 = get_web3()
-        hype = get_hype_contract(w3)
-        usdc = get_usdc_contract(w3)
-        max_approve = 2 ** 256 - 1
-        approve_token(w3, hype, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
-        approve_token(w3, usdc, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
+        for attempt in range(3):
+            w3 = None
+            try:
+                w3 = get_web3()
+                hype = get_hype_contract(w3)
+                usdc = get_usdc_contract(w3)
+                max_approve = 2 ** 256 - 1
+                approve_token(w3, hype, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
+                approve_token(w3, usdc, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
+                break
+            except (Web3Exception, ConnectionError, TimeoutError) as e:
+                logger.warning(f"Startup approval failed: {sanitize_err(str(e))}, rotating provider")
+                if w3 is not None:
+                    rpc_manager.on_error(w3)
+                if attempt >= 2:
+                    logger.error("Startup approvals failed after 3 attempts, continuing...")
 
     if dry_run:
         logger.info("=" * 50)
