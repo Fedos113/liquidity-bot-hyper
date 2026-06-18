@@ -109,14 +109,14 @@ python main.py --no-dry-run --log-level DEBUG
 | `HYPE_ADDRESS` | wHYPE token contract |
 | `USDC_ADDRESS` | USDC token contract |
 
-#### API Keys (provider rotation)
+#### RPC Providers (provider rotation)
 
-| Variable | Description |
-|---|---|
-| `HYPE_RPC_API_KEY` | HypeRPC primary key |
-| `CHAINSTACK_ENDPOINT` | Chainstack HTTPS endpoint |
-| `ALCHEMY_API_KEY` | Alchemy API key |
-| `DRPC_API_KEY` | dRPC API key |
+| Variable | What to put | How the bot uses it |
+|---|---|---|
+| `HYPE_RPC_API_KEY` | API key only | Constructs `https://rpc.hyperpc.app/evm?api_key=<KEY>` |
+| `CHAINSTACK_ENDPOINT` | Full HTTPS URL | Used as-is (e.g. `https://nd-xxx.p2pify.com/abc`) |
+| `ALCHEMY_API_KEY` | API key only | Constructs `https://eth-hyperliquid-mainnet.g.alchemy.com/v2/<KEY>` |
+| `DRPC_API_KEY` | API key only | Constructs `https://lb.drpc.org/ogrpc?network=hyperliquid&dkey=<KEY>` |
 
 The bot auto-detects which keys are provided and builds a rotation chain: **HypeRPC → Chainstack → Alchemy → dRPC → HyperEVM fallback**. If a provider's quota is exceeded, it is permanently disabled for the session. On any RPC error, the bot immediately switches to the next active provider.
 
