@@ -1,5 +1,8 @@
 Q96 = 2 ** 96
 
+HYPE_DECIMALS = 18
+USDC_DECIMALS = 6
+
 TICK_SPACINGS = {
     100: 1,
     500: 10,

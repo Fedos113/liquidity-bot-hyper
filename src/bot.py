@@ -7,10 +7,13 @@ from web3 import Web3
 from web3.exceptions import Web3Exception
 
 from src.config import config
+from src.constants import HYPE_DECIMALS, USDC_DECIMALS
 from src.provider import (
     get_web3,
     get_pool_contract,
     get_position_manager_contract,
+    get_hype_contract,
+    get_usdc_contract,
     rpc_manager,
 )
 from src.math_utils import (
@@ -66,8 +69,8 @@ def _get_pool_cache(w3, pool):
         fee = pool.functions.fee().call()
         tick_spacing = pool.functions.tickSpacing().call()
         token0_is_hype = token0.lower() == config.HYPE_ADDRESS.lower()
-        dec0 = config.HYPE_DECIMALS if token0_is_hype else config.USDC_DECIMALS
-        dec1 = config.HYPE_DECIMALS if not token0_is_hype else config.USDC_DECIMALS
+        dec0 = HYPE_DECIMALS if token0_is_hype else USDC_DECIMALS
+        dec1 = HYPE_DECIMALS if not token0_is_hype else USDC_DECIMALS
         _pool_cache[pool_addr] = {
             "token0": token0, "token1": token1, "fee": fee,
             "tick_spacing": tick_spacing, "token0_is_hype": token0_is_hype,
@@ -92,6 +95,8 @@ def _multicall_price_and_balances(w3, pool):
                 (Web3.to_checksum_address(usdc_con.address), False, usdc_con.encodeABI(fn_name="balanceOf", args=[account])),
             ]
             results = mc3.functions.aggregate3(calls).call()
+            if not all(r[0] for r in results):
+                raise ValueError("MC3 partial failure, falling back")
             slot0_r = pool.decode_function_result("slot0", results[0][1])
             sqrt_price_x96 = slot0_r[0]
             current_tick = slot0_r[1]
@@ -123,6 +128,8 @@ def _multicall_fee_growth_and_ticks(w3, pool, pos):
                 (Web3.to_checksum_address(pool.address), False, pool.encodeABI(fn_name="ticks", args=[pos["tickUpper"]])),
             ]
             results = mc3.functions.aggregate3(calls).call()
+            if not all(r[0] for r in results):
+                raise ValueError("MC3 partial failure, falling back")
             fg0 = int.from_bytes(results[0][1], 'big')
             fg1 = int.from_bytes(results[1][1], 'big')
             slot0_r = pool.decode_function_result("slot0", results[2][1])
@@ -163,30 +170,24 @@ def _compute_unclaimed_fees(pos, fg0, fg1, current_tick, lower_tick, upper_tick)
     return u0, u1
 
 
-def _close_pool_3rpc(pm, cache, tid, pos, dry_run):
-    """Close position using 3 RPC slots: HypeRPC -> Chainstack -> HypeRPC."""
+def _close_pool_3rpc(cache, tid, pos, dry_run):
+    """Close position: collect fees, remove liquidity — priority gas for speed."""
     try:
         w3_slot0 = rpc_manager.get_web3_for_slot(0)
         w3_slot1 = rpc_manager.get_web3_for_slot(1)
-        w3_slot2 = rpc_manager.get_web3_for_slot(0)
 
         pm_slot0 = get_position_manager_contract(w3_slot0)
         pm_slot1 = get_position_manager_contract(w3_slot1)
-        pm_slot2 = get_position_manager_contract(w3_slot2)
 
         pool_slot0 = get_pool_contract(w3_slot0)
 
         current_price, _, _, _, _ = _multicall_price_and_balances(w3_slot0, pool_slot0)
         set_hype_price(current_price)
 
-        collect_fees(w3_slot0, pm_slot0, tid, dry_run)
+        collect_fees(w3_slot0, pm_slot0, tid, dry_run, priority=True)
         sleep(config.TX_INTER_SLEEP)
 
-        remove_liquidity(w3_slot1, pm_slot1, tid, pos["liquidity"], dry_run)
-        sleep(config.TX_INTER_SLEEP)
-
-        collect_fees(w3_slot2, pm_slot2, tid, dry_run)
-        sleep(config.TX_INTER_SLEEP)
+        remove_liquidity(w3_slot1, pm_slot1, tid, pos["liquidity"], dry_run, priority=True)
 
         return current_price
     except (Web3Exception, ConnectionError, TimeoutError, ValueError):
@@ -339,7 +340,7 @@ def _downward_inner_cycle():
                         tid = new_id
 
                 if tid > 0 and pos and pos["liquidity"] > 0:
-                    _close_pool_3rpc(pm, cache, tid, pos, config.DRY_RUN)
+                    _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
                 else:
                     current_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
                     set_hype_price(current_price)
@@ -350,15 +351,9 @@ def _downward_inner_cycle():
                         swap_w3 = rpc_manager.get_web3_for_swap()
                         swap_pool = get_pool_contract(swap_w3)
                         swap_cache = _get_pool_cache(swap_w3, swap_pool)
-                        swap_pm = get_position_manager_contract(swap_w3)
-                        approve_token(
-                            swap_w3, get_hype_or_usdc(swap_w3, True),
-                            config.SWAP_ROUTER_ADDRESS, hype_bal, config.DRY_RUN,
-                        )
-                        sleep(config.TX_INTER_SLEEP)
                         swap_exact_input_single(
                             swap_w3, config.HYPE_ADDRESS, config.USDC_ADDRESS,
-                            swap_cache["fee"], hype_bal, config.DRY_RUN,
+                            swap_cache["fee"], hype_bal, config.DRY_RUN, priority=True,
                         )
                         logger.info("[DOWNWARD-INNER] All wHYPE swapped to USDC")
 
@@ -417,7 +412,7 @@ def _upward_inner_cycle():
                         tid = new_id
 
                 if tid > 0 and pos and pos["liquidity"] > 0:
-                    _close_pool_3rpc(pm, cache, tid, pos, config.DRY_RUN)
+                    _close_pool_3rpc( cache, tid, pos, config.DRY_RUN)
                 else:
                     current_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
                     set_hype_price(current_price)
@@ -428,15 +423,9 @@ def _upward_inner_cycle():
                         swap_w3 = rpc_manager.get_web3_for_swap()
                         swap_pool = get_pool_contract(swap_w3)
                         swap_cache = _get_pool_cache(swap_w3, swap_pool)
-                        swap_pm = get_position_manager_contract(swap_w3)
-                        approve_token(
-                            swap_w3, get_hype_or_usdc(swap_w3, False),
-                            config.SWAP_ROUTER_ADDRESS, usdc_bal, config.DRY_RUN,
-                        )
-                        sleep(config.TX_INTER_SLEEP)
                         swap_exact_input_single(
                             swap_w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
-                            swap_cache["fee"], usdc_bal, config.DRY_RUN,
+                            swap_cache["fee"], usdc_bal, config.DRY_RUN, priority=True,
                         )
                         logger.info("[UPWARD-INNER] All USDC swapped to HYPE")
 
@@ -479,6 +468,14 @@ def run_bot():
     token_id = config.TOKEN_ID
     dry_run = config.DRY_RUN
 
+    if not dry_run:
+        w3 = get_web3()
+        hype = get_hype_contract(w3)
+        usdc = get_usdc_contract(w3)
+        max_approve = 2 ** 256 - 1
+        approve_token(w3, hype, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
+        approve_token(w3, usdc, config.SWAP_ROUTER_ADDRESS, max_approve, dry_run)
+
     if dry_run:
         logger.info("=" * 50)
         logger.info("DRY-RUN MODE: No transactions will be sent")
@@ -493,7 +490,7 @@ def run_bot():
         f"Secondary cycle: interval={config.SECONDARY_INNER}s, "
         f"drop={config.HYPE_DROP_THRESHOLD}, surge={config.HYPE_UPPER_THRESHOLD}"
     )
-    logger.info(f"TX_INTER_SLEEP={config.TX_INTER_SLEEP}s")
+    logger.info(f"TX_INTER_SLEEP={config.TX_INTER_SLEEP}s, PRIORITY_FEE_MULTIPLIER={config.PRIORITY_FEE_MULTIPLIER}x")
     logger.info(f"MIN_WALLET_USD={config.MIN_WALLET_USD}")
 
     token_id_ref[0] = token_id
@@ -561,8 +558,8 @@ def run_bot():
 
                         wallet_val = calculate_usdc_value(
                             current_price,
-                            usdc_bal / 10 ** config.USDC_DECIMALS,
-                            hype_bal / 10 ** config.HYPE_DECIMALS,
+                            usdc_bal / 10 ** USDC_DECIMALS,
+                            hype_bal / 10 ** HYPE_DECIMALS,
                         )
                         logger.info(f"Wallet value: ~${wallet_val:.2f}")
 
@@ -572,7 +569,7 @@ def run_bot():
                             if not in_range:
                                 direction = "below" if current_price < lower_price else "above"
                                 logger.warning(f"Position out of bounds ({direction}), closing and recreating...")
-                                _close_pool_3rpc(pm, cache, token_id, pos, dry_run)
+                                _close_pool_3rpc( cache, token_id, pos, dry_run)
                                 new_id = create_position(
                                     w3, pm, pool, current_price, dry_run,
                                     pool_fee=cache["fee"],
@@ -621,7 +618,7 @@ def run_bot():
                                         increase_liquidity(w3, pm, token_id, am0 or 0, am1 or 0, dry_run)
                         else:
                             logger.warning(f"Position value ${pos_val:.2f} <= $1, closing and recreating...")
-                            _close_pool_3rpc(pm, cache, token_id, pos, dry_run)
+                            _close_pool_3rpc( cache, token_id, pos, dry_run)
                             new_id = create_position(
                                 w3, pm, pool, current_price, dry_run,
                                 pool_fee=cache["fee"],
