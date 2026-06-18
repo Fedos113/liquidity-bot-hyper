@@ -490,20 +490,23 @@ def _upward_inner_cycle():
                     set_hype_price(current_price)
 
                 with tx_lock:
-                    hype_bal, usdc_bal = get_token_balances(w3)
-                    if usdc_bal > 0:
-                        swap_w3 = rpc_manager.get_web3_for_swap()
-                        swap_pool = get_pool_contract(swap_w3)
-                        swap_cache = _get_pool_cache(swap_w3, swap_pool)
-                        amt_out = swap_exact_input_single(
-                            swap_w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
-                            swap_cache["fee"], usdc_bal, config.DRY_RUN, priority=True,
-                        )
-                        if amt_out is not None:
-                            final_hype = (hype_bal + amt_out) / 10 ** HYPE_DECIMALS
-                            total = final_hype * current_price
-                            chart_logger.tp_triggered(current_price, total)
-                        logger.info("[UPWARD-INNER] All USDC swapped to HYPE")
+                    if config.TP_AGGRESSIVE:
+                        hype_bal, usdc_bal = get_token_balances(w3)
+                        if usdc_bal > 0:
+                            swap_w3 = rpc_manager.get_web3_for_swap()
+                            swap_pool = get_pool_contract(swap_w3)
+                            swap_cache = _get_pool_cache(swap_w3, swap_pool)
+                            amt_out = swap_exact_input_single(
+                                swap_w3, config.USDC_ADDRESS, config.HYPE_ADDRESS,
+                                swap_cache["fee"], usdc_bal, config.DRY_RUN, priority=True,
+                            )
+                            if amt_out is not None:
+                                final_hype = (hype_bal + amt_out) / 10 ** HYPE_DECIMALS
+                                total = final_hype * current_price
+                                chart_logger.tp_triggered(current_price, total)
+                            logger.info("[UPWARD-INNER] All USDC swapped to HYPE")
+                    else:
+                        logger.info("[UPWARD-INNER] TP_AGGRESSIVE=false, skipping swap")
 
                     pool_opened = False
                     success = True
@@ -777,16 +780,27 @@ def run_bot():
                             token_id_ref[0] = new_id
                             position_minted = True
                             pool_opened = True
-                            wallet_val = calculate_usdc_value(current_price, usdc_bal / 10**USDC_DECIMALS, hype_bal / 10**HYPE_DECIMALS)
+                            fresh_hype, fresh_usdc = get_token_balances(w3)
+                            wallet_val = calculate_usdc_value(current_price, fresh_usdc / 10**USDC_DECIMALS, fresh_hype / 10**HYPE_DECIMALS)
+                            new_pos = get_position_details(w3, pm, new_id)
+                            if new_pos:
+                                pos_val = position_value_usd(
+                                    new_pos["liquidity"], new_pos["tickLower"], new_pos["tickUpper"],
+                                    sqrt_price_x96, cache["token0_is_hype"], current_price,
+                                    cache["dec0"], cache["dec1"],
+                                )
+                            else:
+                                pos_val = 0
+                            total_val = wallet_val + pos_val
                             target_lower = current_price * config.LOWER_BOUND_PCT
                             target_upper = current_price * config.UPPER_BOUND_PCT
                             tp = target_upper * config.HYPE_UPPER_THRESHOLD
                             sl = target_lower * config.HYPE_DROP_THRESHOLD
                             if not _logged_initial_pool:
-                                chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, wallet_val)
+                                chart_logger.initial_pool(current_price, target_lower, target_upper, tp, sl, total_val)
                                 _logged_initial_pool = True
                             else:
-                                chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, wallet_val)
+                                chart_logger.pool_created(current_price, target_lower, target_upper, tp, sl, total_val)
                         config.TOKEN_ID = new_id
                         logger.info(f"Created new position ID {token_id}")
                         _cached_price = current_price
@@ -799,16 +813,22 @@ def run_bot():
                 cycle_error = True
 
         except (Web3Exception, ConnectionError, TimeoutError) as e:
-            logger.warning(f"RPC error in main cycle: {sanitize_err(str(e))}, cycling provider")
+            logger.warning(f"RPC error in main cycle: {sanitize_err(str(e))}, rotating provider")
             if w3 is not None:
                 _handle_rpc_error(e, w3)
-            cycle_error = True
+            sleep(5)
+            continue
         except Exception as e:
-            logger.warning(f"Cycle error, retrying in 60s: {sanitize_err(str(e))}")
+            logger.warning(f"Cycle error: {sanitize_err(str(e))}")
             cycle_error = True
 
         elapsed = time() - cycle_start
-        remaining = 60 if cycle_error or position_minted else config.SLEEP_INTERVAL - elapsed
+        if cycle_error:
+            remaining = 10
+        elif position_minted:
+            remaining = 30
+        else:
+            remaining = config.SLEEP_INTERVAL - elapsed
         cycle_error = False
         if remaining > 0 and running:
             logger.info(f"Cycle complete. Sleeping for {remaining:.0f}s...")

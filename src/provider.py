@@ -183,35 +183,36 @@ def get_multicall3(w3: Web3) -> Optional[Any]:
     return None
 
 
-def with_retry(max_retries: int = 3, base_delay: int = 0):
+def with_retry(max_retries: int = 1, base_delay: int = 0):
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
-            last_exc = None
-            for attempt in range(max_retries):
+            while True:
                 try:
                     return func(*args, **kwargs)
                 except (Web3Exception, ConnectionError, TimeoutError) as e:
-                    last_exc = e
-                    safe = sanitize_err(str(e))
-                    if attempt < max_retries - 1:
-                        logger.warning(f"RPC error: {safe}. Immediate retry {attempt + 1}/{max_retries}")
-                    else:
-                        logger.warning(f"RPC error: {safe}")
-            if args and isinstance(args[0], Web3):
-                logger.warning(f"RPC retries exhausted on {func.__name__}, rotating provider and retrying...")
+                    logger.warning(f"RPC error: {sanitize_err(str(e))}")
+                if not (args and isinstance(args[0], Web3)):
+                    raise
                 skip_w3 = args[0]
-                for rotate_attempt in range(2):
+                rotated = {id(skip_w3)}
+                all_tried = True
+                for _ in range(len(rpc_manager.get_active())):
+                    new_w3 = skip_w3
                     try:
                         new_w3 = rpc_manager.get_web3_skip(skip_w3)
+                        wid = id(new_w3)
+                        if wid in rotated:
+                            break
+                        rotated.add(wid)
                         new_args = (new_w3,) + args[1:]
-                        logger.info(f"Retrying {func.__name__} on next provider")
+                        logger.info(f"Rotated, retrying {func.__name__}")
                         return func(*new_args, **kwargs)
                     except (Web3Exception, ConnectionError, TimeoutError) as e:
-                        last_exc = e
-                        logger.warning(f"Retry of {func.__name__} failed after rotation: {sanitize_err(str(e))}")
+                        logger.warning(f"Rotation retry of {func.__name__} failed: {sanitize_err(str(e))}")
                         skip_w3 = new_w3
-            raise last_exc
+                logger.warning(f"All providers failed on {func.__name__}, retrying in 5s...")
+                time.sleep(5)
         return wrapper
     return decorator
 
