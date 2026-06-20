@@ -323,6 +323,25 @@ def _secondary_cycle():
                 sleep(1)
             continue
 
+        w3 = get_web3()
+        pool = get_pool_contract(w3)
+        for attempt in range(len(rpc_manager.get_active())):
+            try:
+                fresh_price, _, _, _, _ = _multicall_price_and_balances(w3, pool)
+                _cached_price = fresh_price
+                set_hype_price(fresh_price)
+                break
+            except (Web3Exception, ConnectionError, TimeoutError) as e:
+                logger.warning(f"[SECONDARY] Price fetch failed on RPC attempt {attempt+1}: {sanitize_err(str(e))}")
+                if attempt < len(rpc_manager.get_active()) - 1:
+                    w3 = rpc_manager.on_error(w3)
+                    pool = get_pool_contract(w3)
+                else:
+                    raise
+            except Exception as e:
+                logger.warning(f"[SECONDARY] Price fetch failed: {sanitize_err(str(e))}")
+                raise
+
         try:
             price = _cached_price
             lower = _cached_lower_price
